@@ -1,0 +1,11 @@
+[project]
+name = "ctc-balance"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "substrate-interface>=1.7.11",
+    "requests>=2.31.0",
+    "matplotlib>=3.8.0",
+]
