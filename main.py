@@ -175,13 +175,14 @@ def find_blocks_for_dates(chain: ChainConnector, dates: list[date], cache: dict)
 
 def plot_balances(dates: list[str], all_history: dict, account_names: list[str], 
                   output_file: Path, source_name: str):
-    """Generate and save balance graph."""
+    """Generate and save balance graphs (combined and individual)."""
     date_objects = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
+    colors = plt.cm.tab10.colors
+    graph_files = []
     
+    # === 메인 그래프 (전체 계정 + 총합) ===
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
     fig.suptitle(f"CTC Balance History - {source_name}", fontsize=14, fontweight='bold')
-    
-    colors = plt.cm.tab10.colors
     
     # 상단: 개별 계정
     for i, name in enumerate(account_names):
@@ -218,7 +219,42 @@ def plot_balances(dates: list[str], all_history: dict, account_names: list[str],
     graph_file = output_file.with_suffix('.png')
     plt.savefig(graph_file, dpi=150, bbox_inches='tight')
     plt.close()
-    return graph_file
+    graph_files.append(graph_file)
+    
+    # === 각 계정별 개별 그래프 ===
+    individual_dir = output_file.parent / "individual"
+    individual_dir.mkdir(parents=True, exist_ok=True)
+    
+    for i, name in enumerate(account_names):
+        balances = [all_history.get(name, {}).get(d, 0.0) for d in dates]
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.suptitle(f"CTC Balance History - {name}", fontsize=14, fontweight='bold')
+        
+        color = colors[i % len(colors)]
+        ax.fill_between(date_objects, balances, alpha=0.3, color=color)
+        ax.plot(date_objects, balances, color=color, linewidth=2)
+        
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Balance (CTC)")
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
+        
+        # 시작/끝 잔고 표시
+        if balances:
+            ax.annotate(f'{balances[0]:,.0f}', xy=(date_objects[0], balances[0]), fontsize=9)
+            ax.annotate(f'{balances[-1]:,.0f}', xy=(date_objects[-1], balances[-1]), fontsize=9, ha='right')
+        
+        plt.tight_layout()
+        individual_file = individual_dir / f"{name}.png"
+        plt.savefig(individual_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        graph_files.append(individual_file)
+    
+    return graph_files
 
 
 def main():
@@ -335,15 +371,21 @@ def main():
             print(f"    Warning: Could not read existing file: {e}")
 
     # Merge new data into existing data
-    for date_key, balances in all_history.items():
-        existing_data[date_key] = balances
+    # all_history is {name: {date: balance}}, convert to {date: {name: balance}}
+    for name, date_balances in all_history.items():
+        for date_key, balance in date_balances.items():
+            if date_key not in existing_data:
+                existing_data[date_key] = {}
+            existing_data[date_key][name] = balance
 
-    header = ["date"] + account_names + ["total"]
+    header = ["date"] + account_names + ["total", "diff", "diff_avg10"]
     
     rows = []
+    diffs = []  # diff 값들을 저장
     # Sort by date
     all_date_keys = sorted(existing_data.keys())
     
+    prev_total = None
     for key in all_date_keys:
         row = [key]
         total = 0.0
@@ -352,7 +394,25 @@ def main():
             bal = row_data.get(name, 0.0)
             row.append(bal)
             total += bal
-        row.append(round(total, 1))
+        total = round(total, 1)
+        row.append(total)
+        
+        # 이전 잔고와의 차이 계산
+        if prev_total is not None:
+            diff = round(total - prev_total, 1)
+        else:
+            diff = 0.0
+        row.append(diff)
+        diffs.append(diff)
+        prev_total = total
+        
+        # 10일 평균 계산
+        if len(diffs) >= 10:
+            diff_avg10 = round(sum(diffs[-10:]) / 10, 1)
+        else:
+            diff_avg10 = round(sum(diffs) / len(diffs), 1) if diffs else 0.0
+        row.append(diff_avg10)
+        
         rows.append(row)
     
     with open(output_file, "w", newline="") as f:
@@ -363,9 +423,10 @@ def main():
     print(f"  CSV: {output_file}")
     
     if args.graph and rows:
-        print("  Generating graph...")
-        graph_file = plot_balances(date_keys, all_history, account_names, output_file, source_name)
-        print(f"  Graph: {graph_file}")
+        print("  Generating graphs...")
+        graph_files = plot_balances(all_date_keys, all_history, account_names, output_file, source_name)
+        print(f"  Main graph: {graph_files[0]}")
+        print(f"  Individual graphs: {len(graph_files) - 1} files in {output_file.parent / 'individual'}")
     
     if rows:
         latest = rows[-1]

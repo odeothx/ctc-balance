@@ -32,10 +32,17 @@ def load_accounts(file_path: str | Path) -> dict[str, str]:
             if not line or line.startswith("#"):
                 continue
             
-            # Parse "name = address" format
+            # Parse "name = address" or "name address" format
             if "=" in line:
                 name, address = line.split("=", 1)
                 accounts[name.strip()] = address.strip()
+            else:
+                # Space-separated format: "name address"
+                parts = line.split()
+                if len(parts) >= 2:
+                    name = parts[0]
+                    address = parts[1]
+                    accounts[name] = address
     
     return accounts
 
