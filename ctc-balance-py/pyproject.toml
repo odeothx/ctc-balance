@@ -9,3 +9,14 @@ dependencies = [
     "requests>=2.31.0",
     "matplotlib>=3.8.0",
 ]
+
+[project.scripts]
+balance = "main:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
+py-modules = ["main", "accounts"]

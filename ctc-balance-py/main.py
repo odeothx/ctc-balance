@@ -310,10 +310,47 @@ def main():
     print(f"\n[4/5] Fetching balances (Parallel)...")
     all_history = {name: {} for name in accounts}
     
+    output_file = Path(args.output) if args.output else OUTPUT_DIR / f"{source_name}_history.csv"
+    
+    # Load existing data if file exists (to skip already fetched dates)
+    existing_data = {}
+    if output_file.exists():
+        print(f"  Loading existing data from {output_file.name}...")
+        try:
+            with open(output_file, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    d_key = row["date"]
+                    # Validate date format to skip corrupt rows from previous runs
+                    try:
+                        datetime.strptime(d_key, "%Y-%m-%d")
+                    except ValueError:
+                        continue
+                        
+                    # Convert values to float
+                    data = {}
+                    for k, v in row.items():
+                        if k not in ["date", "total"]:
+                            try:
+                                data[k] = float(v)
+                            except ValueError:
+                                data[k] = 0.0
+                    existing_data[d_key] = data
+        except Exception as e:
+            print(f"    Warning: Could not read existing file: {e}")
+
     tasks = []
     # 처리할 작업 목록 생성
     for d in dates:
         key = d.isoformat()
+        
+        # Check if we already have data for this date and all accounts
+        if key in existing_data:
+            # Check if all requested accounts are present in the existing data
+            all_accounts_exist = all(acc in existing_data[key] for acc in accounts)
+            if all_accounts_exist:
+                continue
+        
         block_info = block_map.get(key)
         
         if block_info:
@@ -345,30 +382,9 @@ def main():
     print(f"\n[5/5] Saving results...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    output_file = Path(args.output) if args.output else OUTPUT_DIR / f"{source_name}_history.csv"
-    
     account_names = sorted(accounts.keys())
     
-    # Load existing data if file exists
-    existing_data = {}
-    if output_file.exists():
-        print(f"  Loading existing data from {output_file.name}...")
-        try:
-            with open(output_file, "r") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    d_key = row["date"]
-                    # Convert values to float
-                    data = {}
-                    for k, v in row.items():
-                        if k not in ["date", "total"]:
-                            try:
-                                data[k] = float(v)
-                            except ValueError:
-                                data[k] = 0.0
-                    existing_data[d_key] = data
-        except Exception as e:
-            print(f"    Warning: Could not read existing file: {e}")
+
 
     # Merge new data into existing data
     # all_history is {name: {date: balance}}, convert to {date: {name: balance}}
@@ -420,11 +436,56 @@ def main():
         writer.writerow(header)
         writer.writerows(rows)
     
-    print(f"  CSV: {output_file}")
+    print(f"  CSV (Combined): {output_file}")
+    
+    # === 각 계정별 개별 CSV 저장 ===
+    individual_dir = output_file.parent / "individual"
+    individual_dir.mkdir(parents=True, exist_ok=True)
+    
+    for name in account_names:
+        indiv_csv = individual_dir / f"{name}.csv"
+        indiv_rows = []
+        indiv_diffs = []
+        prev_bal = None
+        
+        for key in all_date_keys:
+            bal = existing_data[key].get(name, 0.0)
+            
+            # 차이 계산
+            if prev_bal is not None:
+                d = round(bal - prev_bal, 1)
+            else:
+                d = 0.0
+            
+            indiv_diffs.append(d)
+            
+            # 10일 평균 계산
+            if len(indiv_diffs) >= 10:
+                d_avg10 = round(sum(indiv_diffs[-10:]) / 10, 1)
+            else:
+                d_avg10 = round(sum(indiv_diffs) / len(indiv_diffs), 1) if indiv_diffs else 0.0
+                
+            indiv_rows.append([key, bal, d, d_avg10])
+            prev_bal = bal
+            
+        with open(indiv_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "balance", "diff", "diff_avg10"])
+            writer.writerows(indiv_rows)
+            
+    print(f"  CSV (Individual): {len(account_names)} files in {individual_dir}")
     
     if args.graph and rows:
         print("  Generating graphs...")
-        graph_files = plot_balances(all_date_keys, all_history, account_names, output_file, source_name)
+        # Reconstruct full history for plotting
+        full_history = {name: {} for name in account_names}
+        for d_key in all_date_keys:
+            row_data = existing_data[d_key]
+            for acc_name in account_names:
+                if acc_name in row_data:
+                    full_history[acc_name][d_key] = row_data[acc_name]
+                    
+        graph_files = plot_balances(all_date_keys, full_history, account_names, output_file, source_name)
         print(f"  Main graph: {graph_files[0]}")
         print(f"  Individual graphs: {len(graph_files) - 1} files in {output_file.parent / 'individual'}")
     

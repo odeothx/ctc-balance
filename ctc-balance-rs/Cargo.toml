@@ -1,0 +1,46 @@
+[package]
+name = "ctc-balance"
+version = "0.1.0"
+edition = "2021"
+description = "CTC Balance Tracker - Track Creditcoin3 wallet balances"
+authors = ["CTC Balance Team"]
+
+[dependencies]
+# Substrate RPC client
+subxt = "0.38"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CSV handling
+csv = "1"
+
+# Graph generation
+plotters = "0.3"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Parallel processing
+futures = "0.3"
+
+# Hex encoding
+hex = "0.4"
+
+# Async traits
+async-trait = "0.1"
+
+[[bin]]
+name = "ctc-balance"
+path = "src/main.rs"
