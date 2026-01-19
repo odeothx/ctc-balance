@@ -38,6 +38,11 @@ impl ChainConnector {
         }
     }
 
+    /// Get the URL
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     /// Connect to the node
     pub async fn connect(&mut self) -> Result<()> {
         let rpc_client = RpcClient::from_url(&self.url)

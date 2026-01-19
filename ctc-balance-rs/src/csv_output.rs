@@ -16,6 +16,11 @@ pub struct HistoryEntry {
     pub total: f64,
     pub diff: f64,
     pub diff_avg10: f64,
+    // Reward fields
+    pub rewards: HashMap<String, f64>,
+    pub total_reward: f64,
+    pub reward_avg10: f64,
+    pub total_reward_cumulative: f64,
 }
 
 /// Save combined CSV with all accounts
@@ -23,6 +28,7 @@ pub fn save_combined_csv<P: AsRef<Path>>(
     output_file: P,
     account_names: &[String],
     entries: &[HistoryEntry],
+    include_rewards: bool,
 ) -> Result<()> {
     let path = output_file.as_ref();
 
@@ -43,6 +49,18 @@ pub fn save_combined_csv<P: AsRef<Path>>(
         "diff".to_string(),
         "diff_avg10".to_string(),
     ]);
+
+    // Add reward columns if enabled
+    if include_rewards {
+        for name in account_names {
+            header.push(format!("{}_reward", name));
+        }
+        header.extend([
+            "total_reward".to_string(),
+            "reward_avg10".to_string(),
+            "total_reward_cumulative".to_string(),
+        ]);
+    }
     writeln!(file, "{}", header.join(","))?;
 
     // Write data rows
@@ -58,6 +76,17 @@ pub fn save_combined_csv<P: AsRef<Path>>(
         row.push(format!("{:.1}", entry.diff));
         row.push(format!("{:.1}", entry.diff_avg10));
 
+        // Add reward data if enabled
+        if include_rewards {
+            for name in account_names {
+                let reward = entry.rewards.get(name).unwrap_or(&0.0);
+                row.push(format!("{:.4}", reward));
+            }
+            row.push(format!("{:.4}", entry.total_reward));
+            row.push(format!("{:.4}", entry.reward_avg10));
+            row.push(format!("{:.4}", entry.total_reward_cumulative));
+        }
+
         writeln!(file, "{}", row.join(","))?;
     }
 
@@ -70,9 +99,12 @@ pub fn save_individual_csvs<P: AsRef<Path>>(
     account_names: &[String],
     all_history: &HashMap<String, HashMap<String, f64>>,
     sorted_dates: &[String],
+    reward_history: Option<&HashMap<String, HashMap<String, f64>>>, // account_name -> date -> reward
 ) -> Result<()> {
     let dir = output_dir.as_ref();
     fs::create_dir_all(dir).context("Failed to create individual directory")?;
+
+    let include_rewards = reward_history.is_some();
 
     for name in account_names {
         let csv_path = dir.join(format!("{}.csv", name));
@@ -80,11 +112,22 @@ pub fn save_individual_csvs<P: AsRef<Path>>(
             File::create(&csv_path).context(format!("Failed to create {:?}", csv_path))?;
 
         // Write header
-        writeln!(file, "date,balance,diff,diff_avg10")?;
+        if include_rewards {
+            writeln!(
+                file,
+                "date,balance,diff,diff_avg10,reward,reward_avg10,reward_cumulative"
+            )?;
+        } else {
+            writeln!(file, "date,balance,diff,diff_avg10")?;
+        }
 
         let account_history = all_history.get(name);
+        let account_rewards = reward_history.and_then(|r| r.get(name));
+
         let mut prev_balance: Option<f64> = None;
         let mut diffs: Vec<f64> = Vec::new();
+        let mut rewards_for_avg: Vec<f64> = Vec::new();
+        let mut reward_cumulative: f64 = 0.0;
 
         for date in sorted_dates {
             let balance = account_history
@@ -92,14 +135,14 @@ pub fn save_individual_csvs<P: AsRef<Path>>(
                 .copied()
                 .unwrap_or(0.0);
 
-            // Calculate diff
+            // Calculate balance diff
             let diff = match prev_balance {
                 Some(prev) => balance - prev,
                 None => 0.0,
             };
             diffs.push(diff);
 
-            // Calculate 10-day average
+            // Calculate 10-day average for balance
             let diff_avg10 = if diffs.len() >= 10 {
                 let last_10: f64 = diffs.iter().rev().take(10).sum();
                 last_10 / 10.0
@@ -109,11 +152,38 @@ pub fn save_individual_csvs<P: AsRef<Path>>(
                 0.0
             };
 
-            writeln!(
-                file,
-                "{},{:.1},{:.1},{:.1}",
-                date, balance, diff, diff_avg10
-            )?;
+            if include_rewards {
+                let reward = account_rewards
+                    .and_then(|r| r.get(date))
+                    .copied()
+                    .unwrap_or(0.0);
+
+                reward_cumulative += reward;
+
+                rewards_for_avg.push(reward);
+
+                // Calculate 10-day average for reward
+                let reward_avg10 = if rewards_for_avg.len() >= 10 {
+                    let last_10: f64 = rewards_for_avg.iter().rev().take(10).sum();
+                    last_10 / 10.0
+                } else if !rewards_for_avg.is_empty() {
+                    rewards_for_avg.iter().sum::<f64>() / rewards_for_avg.len() as f64
+                } else {
+                    0.0
+                };
+
+                writeln!(
+                    file,
+                    "{},{:.1},{:.1},{:.1},{:.4},{:.4},{:.4}",
+                    date, balance, diff, diff_avg10, reward, reward_avg10, reward_cumulative
+                )?;
+            } else {
+                writeln!(
+                    file,
+                    "{},{:.1},{:.1},{:.1}",
+                    date, balance, diff, diff_avg10
+                )?;
+            }
 
             prev_balance = Some(balance);
         }

@@ -9,13 +9,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-/// Generate main balance graph (combined + total)
+/// Generate main balance graph (combined + total + rewards if available)
 pub fn plot_balances<P: AsRef<Path>>(
     output_file: P,
     dates: &[String],
     all_history: &HashMap<String, HashMap<String, f64>>,
     account_names: &[String],
     source_name: &str,
+    reward_history: Option<&HashMap<String, f64>>, // date -> total_reward
 ) -> Result<Vec<std::path::PathBuf>> {
     let path = output_file.as_ref();
     let mut generated_files = Vec::new();
@@ -79,13 +80,25 @@ pub fn plot_balances<P: AsRef<Path>>(
 
     let max_total: f64 = totals.iter().cloned().fold(0.0f64, |a, b| a.max(b));
 
-    // Create the main graph (2-panel)
+    // Determine if we have reward data
+    let has_rewards = reward_history.is_some();
+    let graph_height = if has_rewards { 1400 } else { 1000 };
+
+    // Create the main graph (2 or 3-panel)
     let png_path = path.with_extension("png");
     {
-        let root = BitMapBackend::new(&png_path, (1400, 1000)).into_drawing_area();
+        let root = BitMapBackend::new(&png_path, (1400, graph_height)).into_drawing_area();
         root.fill(&WHITE)?;
 
-        let (upper, lower) = root.split_vertically(500);
+        let panels = if has_rewards {
+            // 3-panel layout: top (400), middle (400), bottom (500)
+            let (top_mid, bottom) = root.split_vertically((graph_height as u32 * 6) / 10);
+            let (upper, lower) = top_mid.split_vertically((graph_height as u32 * 3) / 10);
+            (upper, lower, Some(bottom))
+        } else {
+            let (upper, lower) = root.split_vertically(500);
+            (upper, lower, None)
+        };
 
         // Title
         root.draw(&Text::new(
@@ -100,7 +113,7 @@ pub fn plot_balances<P: AsRef<Path>>(
                 date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
             let y_max = max_individual * 1.1;
 
-            let mut chart = ChartBuilder::on(&upper)
+            let mut chart = ChartBuilder::on(&panels.0)
                 .margin(40)
                 .x_label_area_size(30)
                 .y_label_area_size(80)
@@ -143,13 +156,13 @@ pub fn plot_balances<P: AsRef<Path>>(
                 .draw()?;
         }
 
-        // Lower panel: Total balance
+        // Middle panel: Total balance
         {
             let x_range =
                 date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
             let y_max = max_total * 1.1;
 
-            let mut chart = ChartBuilder::on(&lower)
+            let mut chart = ChartBuilder::on(&panels.1)
                 .margin(40)
                 .x_label_area_size(30)
                 .y_label_area_size(80)
@@ -174,6 +187,51 @@ pub fn plot_balances<P: AsRef<Path>>(
 
             // Line
             chart.draw_series(LineSeries::new(total_data, BLUE.stroke_width(2)))?;
+        }
+
+        // Bottom panel: Daily rewards (if available)
+        if let (Some(reward_data), Some(bottom_panel)) = (reward_history, panels.2) {
+            let rewards: Vec<f64> = dates
+                .iter()
+                .map(|d| reward_data.get(d).copied().unwrap_or(0.0))
+                .collect();
+
+            let max_reward = rewards.iter().cloned().fold(0.0f64, |a, b| a.max(b)) * 1.2;
+            let max_reward = if max_reward <= 0.0 { 1.0 } else { max_reward };
+
+            let x_range =
+                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
+
+            let mut chart = ChartBuilder::on(&bottom_panel)
+                .margin(40)
+                .x_label_area_size(30)
+                .y_label_area_size(80)
+                .caption("Daily Staking Rewards", ("sans-serif", 18))
+                .build_cartesian_2d(x_range, 0.0..max_reward)?;
+
+            chart
+                .configure_mesh()
+                .x_labels(12)
+                .y_labels(10)
+                .y_label_formatter(&|v| format!("{:.2}", v))
+                .draw()?;
+
+            // Draw bars for each day
+            let bar_color = RGBColor(76, 175, 80); // Green
+            let bar_width = chrono::Duration::hours(12);
+
+            let reward_data: Vec<(NaiveDate, f64)> = date_objects
+                .iter()
+                .cloned()
+                .zip(rewards.iter().cloned())
+                .filter(|(_, r)| *r > 0.0)
+                .collect();
+
+            chart.draw_series(reward_data.iter().map(|(date, reward)| {
+                let x0 = *date - bar_width;
+                let x1 = *date + bar_width;
+                Rectangle::new([(x0, 0.0), (x1, *reward)], bar_color.filled())
+            }))?;
         }
 
         root.present()?;
@@ -205,39 +263,126 @@ pub fn plot_balances<P: AsRef<Path>>(
             continue;
         }
 
-        let root = BitMapBackend::new(&individual_path, (1200, 600)).into_drawing_area();
+        // Check if we have reward data for this account
+        let has_account_rewards = reward_history.is_some();
+        let graph_height = if has_account_rewards { 900 } else { 600 };
+
+        let root = BitMapBackend::new(&individual_path, (1200, graph_height)).into_drawing_area();
         root.fill(&WHITE)?;
 
         let x_range = date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
 
-        let mut chart = ChartBuilder::on(&root)
-            .margin(40)
-            .x_label_area_size(40)
-            .y_label_area_size(80)
-            .caption(
-                format!("CTC Balance History - {}", name),
-                ("sans-serif", 20),
-            )
-            .build_cartesian_2d(x_range, 0.0..max_balance)?;
+        if has_account_rewards {
+            // 2-panel layout: balance on top, reward on bottom
+            let (upper, lower) = root.split_vertically(500);
 
-        chart
-            .configure_mesh()
-            .x_labels(12)
-            .y_labels(10)
-            .y_label_formatter(&|v| format_ctc(*v))
-            .draw()?;
+            // Upper panel: Balance
+            {
+                let mut chart = ChartBuilder::on(&upper)
+                    .margin(40)
+                    .x_label_area_size(40)
+                    .y_label_area_size(80)
+                    .caption(
+                        format!("CTC Balance History - {}", name),
+                        ("sans-serif", 20),
+                    )
+                    .build_cartesian_2d(x_range.clone(), 0.0..max_balance)?;
 
-        let data: Vec<(NaiveDate, f64)> = date_objects
-            .iter()
-            .cloned()
-            .zip(balances.iter().cloned())
-            .collect();
+                chart
+                    .configure_mesh()
+                    .x_labels(12)
+                    .y_labels(10)
+                    .y_label_formatter(&|v| format_ctc(*v))
+                    .draw()?;
 
-        // Area fill
-        chart.draw_series(AreaSeries::new(data.clone(), 0.0, color.mix(0.3)))?;
+                let data: Vec<(NaiveDate, f64)> = date_objects
+                    .iter()
+                    .cloned()
+                    .zip(balances.iter().cloned())
+                    .collect();
 
-        // Line
-        chart.draw_series(LineSeries::new(data, color.stroke_width(2)))?;
+                // Area fill
+                chart.draw_series(AreaSeries::new(data.clone(), 0.0, color.mix(0.3)))?;
+
+                // Line
+                chart.draw_series(LineSeries::new(data, color.stroke_width(2)))?;
+            }
+
+            // Lower panel: Rewards (using total rewards for this date)
+            if let Some(reward_data) = reward_history {
+                let rewards: Vec<f64> = dates
+                    .iter()
+                    .map(|d| reward_data.get(d).copied().unwrap_or(0.0))
+                    .collect();
+
+                let max_reward = rewards.iter().cloned().fold(0.0f64, |a, b| a.max(b)) * 1.2;
+                let max_reward = if max_reward <= 0.0 { 1.0 } else { max_reward };
+
+                let mut chart = ChartBuilder::on(&lower)
+                    .margin(40)
+                    .x_label_area_size(40)
+                    .y_label_area_size(80)
+                    .caption(
+                        format!("Daily Staking Rewards - {}", name),
+                        ("sans-serif", 18),
+                    )
+                    .build_cartesian_2d(x_range.clone(), 0.0..max_reward)?;
+
+                chart
+                    .configure_mesh()
+                    .x_labels(12)
+                    .y_labels(8)
+                    .y_label_formatter(&|v| format!("{:.2}", v))
+                    .draw()?;
+
+                // Draw bars for each day
+                let bar_color = RGBColor(76, 175, 80); // Green
+                let bar_width = chrono::Duration::hours(12);
+
+                let reward_data_filtered: Vec<(NaiveDate, f64)> = date_objects
+                    .iter()
+                    .cloned()
+                    .zip(rewards.iter().cloned())
+                    .filter(|(_, r)| *r > 0.0)
+                    .collect();
+
+                chart.draw_series(reward_data_filtered.iter().map(|(date, reward)| {
+                    let x0 = *date - bar_width;
+                    let x1 = *date + bar_width;
+                    Rectangle::new([(x0, 0.0), (x1, *reward)], bar_color.filled())
+                }))?;
+            }
+        } else {
+            // Single panel: Balance only
+            let mut chart = ChartBuilder::on(&root)
+                .margin(40)
+                .x_label_area_size(40)
+                .y_label_area_size(80)
+                .caption(
+                    format!("CTC Balance History - {}", name),
+                    ("sans-serif", 20),
+                )
+                .build_cartesian_2d(x_range, 0.0..max_balance)?;
+
+            chart
+                .configure_mesh()
+                .x_labels(12)
+                .y_labels(10)
+                .y_label_formatter(&|v| format_ctc(*v))
+                .draw()?;
+
+            let data: Vec<(NaiveDate, f64)> = date_objects
+                .iter()
+                .cloned()
+                .zip(balances.iter().cloned())
+                .collect();
+
+            // Area fill
+            chart.draw_series(AreaSeries::new(data.clone(), 0.0, color.mix(0.3)))?;
+
+            // Line
+            chart.draw_series(LineSeries::new(data, color.stroke_width(2)))?;
+        }
 
         root.present()?;
         generated_files.push(individual_path_clone);

@@ -143,22 +143,39 @@ impl BalanceTracker {
         }
     }
 
-    /// Get balances for multiple accounts
+    /// Get balances for multiple accounts in parallel
     pub async fn get_all_balances(
         &mut self,
         accounts: &HashMap<String, String>,
         block_hash: &str,
     ) -> Result<HashMap<String, Balance>> {
-        let mut balances = HashMap::new();
+        self.ensure_connected().await?;
 
+        let client = self.client.clone().context("Client not initialized")?;
+        let block_hash_str = block_hash.to_string();
+
+        let mut tasks = Vec::new();
         for (name, address) in accounts {
-            match self.get_balance(address, block_hash).await {
-                Ok(balance) => {
-                    balances.insert(name.clone(), balance);
-                }
-                Err(_e) => {
-                    balances.insert(name.clone(), Balance::zero());
-                }
+            let name = name.clone();
+            let address = address.clone();
+            let mut tracker = BalanceTracker {
+                url: self.url.clone(),
+                client: Some(client.clone()),
+                _rpc: None,
+            };
+            let block_hash_task = block_hash_str.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let res = tracker.get_balance(&address, &block_hash_task).await;
+                (name, res.unwrap_or_else(|_| Balance::zero()))
+            }));
+        }
+
+        let results = futures::future::join_all(tasks).await;
+        let mut balances = HashMap::new();
+        for res in results {
+            if let Ok((name, balance)) = res {
+                balances.insert(name, balance);
             }
         }
 
@@ -200,5 +217,47 @@ fn parse_field_value(debug_str: &str, field_name: &str) -> Option<u128> {
 fn parse_ss58_address(address: &str) -> Result<subxt::utils::AccountId32> {
     use std::str::FromStr;
     subxt::utils::AccountId32::from_str(address)
-        .map_err(|e| anyhow::anyhow!("Invalid SS58 address: {}", e))
+        .map_err(|e| anyhow::anyhow!("Invalid SS58 address '{}': {}", address, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_field_value() {
+        let debug_str = r#"Composite(Named([("free", Value { value: Primitive(U128(1000000000000000000)) }), ("reserved", Value { value: Primitive(U128(500000000000000000)) }), ("frozen", Value { value: Primitive(U128(0)) })]))"#;
+
+        assert_eq!(
+            parse_field_value(debug_str, "free"),
+            Some(1000000000000000000)
+        );
+        assert_eq!(
+            parse_field_value(debug_str, "reserved"),
+            Some(500000000000000000)
+        );
+        assert_eq!(parse_field_value(debug_str, "frozen"), Some(0));
+        assert_eq!(parse_field_value(debug_str, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_parse_ss58_address() {
+        // Valid SS58 address (Creditcoin/Substrate)
+        let addr = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+        assert!(parse_ss58_address(addr).is_ok());
+
+        // Invalid address
+        let invalid_addr = "invalid";
+        assert!(parse_ss58_address(invalid_addr).is_err());
+    }
+
+    #[test]
+    fn test_balance_total() {
+        let b = Balance {
+            free: 100.0,
+            reserved: 50.0,
+            frozen: 10.0,
+        };
+        assert_eq!(b.total(), 150.0);
+    }
 }
