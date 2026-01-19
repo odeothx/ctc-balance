@@ -9,6 +9,7 @@ pub mod chain;
 pub mod csv_output;
 pub mod plot;
 pub mod reward;
+pub mod subscan;
 
 pub use accounts::load_accounts;
 pub use balance::{Balance, BalanceTracker};
@@ -18,6 +19,7 @@ pub use cache::{
 };
 pub use chain::ChainConnector;
 pub use reward::{RewardTracker, StakingReward};
+pub use subscan::SubscanClient;
 
 /// Creditcoin3 mainnet genesis date (2024-08-29)
 pub const GENESIS_DATE: &str = "2024-08-29";

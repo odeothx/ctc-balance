@@ -206,54 +206,60 @@ impl RewardTracker {
                                 let is_reward_variant =
                                     variant == "Rewarded" || variant == "Reward";
 
+                                if !is_reward_variant {
+                                    continue;
+                                }
+
                                 // Stringify only once per event
                                 let debug_str = format!("{:?}", decoded);
+
+                                // Extract stash field (validator/nominator account)
+                                let stash_str = extract_stash_field(&debug_str);
 
                                 for (account_bytes, (name, total, ss58_addr)) in
                                     account_lookup.iter_mut()
                                 {
+                                    // Only match in stash field, not entire event
                                     let matched = match_account_in_debug_str(
-                                        &debug_str,
+                                        &stash_str,
                                         account_bytes,
                                         ss58_addr,
                                     );
 
                                     if matched {
-                                        if is_reward_variant {
+                                        if cfg!(debug_assertions) {
+                                            println!(
+                                                "  [DEBUG] Found {}.{} at block {}: stash={}",
+                                                pallet, variant, block, stash_str
+                                            );
+                                        }
+                                        let amount =
+                                            parse_u128_from_debug(&debug_str, "amount")
+                                                .or_else(|| {
+                                                    parse_u128_from_debug(&debug_str, "reward")
+                                                })
+                                                .or_else(|| {
+                                                    parse_u128_from_debug(&debug_str, "value")
+                                                })
+                                                .or_else(|| {
+                                                    parse_u128_from_debug(&debug_str, "1")
+                                                })
+                                                .or_else(|| find_any_u128(&debug_str));
+
+                                        if let Some(amt) = amount {
                                             if cfg!(debug_assertions) {
                                                 println!(
-                                                    "  [DEBUG] Found {}.{} at block {}: {}",
-                                                    pallet, variant, block, debug_str
+                                                    "  [DEBUG] Matched account {} (stash) with reward {}",
+                                                    name, amt
                                                 );
                                             }
-                                            let amount =
-                                                parse_u128_from_debug(&debug_str, "amount")
-                                                    .or_else(|| {
-                                                        parse_u128_from_debug(&debug_str, "reward")
-                                                    })
-                                                    .or_else(|| {
-                                                        parse_u128_from_debug(&debug_str, "value")
-                                                    })
-                                                    .or_else(|| {
-                                                        parse_u128_from_debug(&debug_str, "1")
-                                                    })
-                                                    .or_else(|| find_any_u128(&debug_str));
-
-                                            if let Some(amt) = amount {
-                                                if cfg!(debug_assertions) {
-                                                    println!(
-                                                        "  [DEBUG] Matched account {} with reward {}",
-                                                        name, amt
-                                                    );
-                                                }
-                                                *total += amt;
-                                            } else {
-                                                if cfg!(debug_assertions) {
-                                                    println!(
-                                                        "  [DEBUG] Matched account {} but could not parse amount from: {}",
-                                                        name, debug_str
-                                                    );
-                                                }
+                                            *total += amt;
+                                        } else {
+                                            if cfg!(debug_assertions) {
+                                                println!(
+                                                    "  [DEBUG] Matched account {} but could not parse amount from: {}",
+                                                    name, debug_str
+                                                );
                                             }
                                         }
                                     }
@@ -283,6 +289,67 @@ impl RewardTracker {
 
         Ok(results)
     }
+}
+
+/// Extract the stash field from a Staking.Rewarded event debug string.
+/// The stash field contains the validator/nominator account.
+fn extract_stash_field(debug_str: &str) -> String {
+    // Look for ("stash", ...) pattern and extract everything until the next top-level field
+    if let Some(stash_start) = debug_str.find("(\"stash\"") {
+        let remaining = &debug_str[stash_start..];
+        // Find the matching closing paren by counting brackets
+        let mut depth = 0;
+        let mut end_pos = 0;
+        for (i, c) in remaining.chars().enumerate() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_pos = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end_pos > 0 {
+            return remaining[..end_pos].to_string();
+        }
+    }
+    // Fallback: return the whole string if stash not found
+    debug_str.to_string()
+}
+
+/// Extract the dest field from a Staking.Rewarded event debug string.
+/// The dest field contains the actual recipient of the reward.
+#[allow(dead_code)]
+fn extract_dest_field(debug_str: &str) -> String {
+    // Look for ("dest", ...) pattern and extract everything until the next top-level field
+    if let Some(dest_start) = debug_str.find("(\"dest\"") {
+        let remaining = &debug_str[dest_start..];
+        // Find the matching closing paren by counting brackets
+        let mut depth = 0;
+        let mut end_pos = 0;
+        for (i, c) in remaining.chars().enumerate() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_pos = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end_pos > 0 {
+            return remaining[..end_pos].to_string();
+        }
+    }
+    // Fallback: return the whole string if dest not found
+    debug_str.to_string()
 }
 
 /// Parse a u128 value from debug string
