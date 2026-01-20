@@ -322,11 +322,11 @@ pub fn plot_balances<P: AsRef<Path>>(
             }
 
             // Lower panel: Rewards (using account-specific rewards if available, else fallback to total)
-            let account_reward_data = individual_reward_history.and_then(|h| h.get(name));
+            let reward_map = individual_reward_history
+                .and_then(|h| h.get(name))
+                .or(total_reward_history);
 
-            if let Some(reward_map) =
-                account_reward_data.or(total_reward_history.and_then(|_| None))
-            {
+            if let Some(reward_map) = reward_map {
                 // We have specific rewards for this account
                 let rewards: Vec<f64> = dates
                     .iter()
