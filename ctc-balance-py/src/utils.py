@@ -6,7 +6,11 @@ import csv
 import json
 from pathlib import Path
 from datetime import datetime, date, timezone
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
+import functools
+import time
+
+T = TypeVar("T")
 
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
@@ -112,6 +116,35 @@ def save_csv(
         if write_header:
             writer.writerow(header)
         writer.writerows(rows)
+
+
+def retry(
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    exceptions: tuple[type[Exception], ...] = (Exception,),
+):
+    """
+    Decorator to retry a function on exception.
+    Similar to the Rust retry! macro.
+    """
+
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            last_exception = None
+            for i in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    delay = base_delay * (2**i)
+                    # print(f"  Retry {i+1}/{max_retries} for {func.__name__} after {delay}s due to: {e}")
+                    time.sleep(delay)
+            raise cast(Exception, last_exception)
+
+        return wrapper
+
+    return decorator
 
 
 def format_ctc(amount: float) -> str:

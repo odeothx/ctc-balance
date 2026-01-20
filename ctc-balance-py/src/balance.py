@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from src.chain import ChainConnector
 
 
+from src.utils import retry
+
 # CTC 단위
 CTC_DECIMALS = 18
+CTC_DIVISOR = 10**CTC_DECIMALS
 
 
 @dataclass
@@ -39,8 +42,9 @@ class BalanceTracker:
     def __init__(self, chain: ChainConnector | None = None):
         self.chain = chain or ChainConnector()
 
+    @retry(max_retries=3)
     def get_balance(
-        self, address: str, block_hash: str | None = None
+        self, address: str, block_hash: str | None = None, force_refetch: bool = False
     ) -> Balance:
         """
         Get account balance at a specific block.
@@ -48,6 +52,7 @@ class BalanceTracker:
         Args:
             address: Account SS58 address
             block_hash: Block hash (None for latest)
+            force_refetch: If balance is 0, try fetching from finalized head
 
         Returns:
             Balance object
@@ -60,13 +65,17 @@ class BalanceTracker:
         )
 
         data = result.value["data"]
-        divisor = 10**CTC_DECIMALS
+        free = int(data["free"]) / CTC_DIVISOR
+        reserved = int(data["reserved"]) / CTC_DIVISOR
+        frozen = int(data.get("frozen", 0)) / CTC_DIVISOR
 
-        return Balance(
-            free=int(data["free"]) / divisor,
-            reserved=int(data["reserved"]) / divisor,
-            frozen=int(data.get("frozen", 0)) / divisor,
-        )
+        if free == 0.0 and reserved == 0.0 and force_refetch:
+            # Try once more with finalized head to be sure
+            latest_hash = self.chain.substrate.get_block_hash()
+            if latest_hash != block_hash:
+                return self.get_balance(address, latest_hash, force_refetch=False)
+
+        return Balance(free=free, reserved=reserved, frozen=frozen)
 
     def get_balances_batch(
         self, accounts: dict[str, str], block_hash: str | None = None
@@ -78,7 +87,10 @@ class BalanceTracker:
         return self.get_all_balances(accounts, block_hash)
 
     def get_all_balances(
-        self, accounts: dict[str, str], block_hash: str | None = None
+        self, 
+        accounts: dict[str, str], 
+        block_hash: str | None = None,
+        force_refetch: bool = False
     ) -> dict[str, Balance]:
         """
         Get balances for all accounts at a specific block.
@@ -86,8 +98,7 @@ class BalanceTracker:
         balances = {}
         for name, address in accounts.items():
             try:
-                balances[name] = self.get_balance(address, block_hash)
-            except Exception as e:
-                # print(f"  Warning: Failed to get balance for {name}: {e}")
+                balances[name] = self.get_balance(address, block_hash, force_refetch=force_refetch)
+            except Exception:
                 balances[name] = Balance(free=0.0, reserved=0.0, frozen=0.0)
         return balances

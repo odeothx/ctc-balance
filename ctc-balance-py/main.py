@@ -36,6 +36,14 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 CACHE_FILE = OUTPUT_DIR / "block_cache.json"
 REWARD_CACHE_FILE = OUTPUT_DIR / "reward_cache.json"
 
+# Concurrency Constants (Matched with Rust version)
+CONCURRENCY_DATES = 5
+CONCURRENCY_BALANCES = 3
+CONCURRENCY_REWARDS = 2
+CONCURRENCY_STORAGE = 10
+CONCURRENCY_EVENTS = 50
+CONCURRENCY_EXPOSURES = 20
+
 
 def format_ctc(amount: float) -> str:
     """Format CTC amount with commas."""
@@ -112,7 +120,7 @@ def _find_block_worker(d: date) -> tuple[date, int, str]:
                 raise
 
 
-def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict) -> tuple[str, dict]:
+def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict, refetch_zero: bool = False) -> tuple[str, dict]:
     """Worker for fetching balances in parallel."""
     if worker_chain is None:
          raise RuntimeError("Worker chain not initialized")
@@ -122,8 +130,8 @@ def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict) -> tup
     
     try:
         # returns {name: Balance}
-        balances = tracker.get_all_balances(accounts, block_hash)
-        results = {name: round(b.free, 1) for name, b in balances.items()}
+        balances = tracker.get_all_balances(accounts, block_hash, force_refetch=refetch_zero)
+        results = {name: b.free for name, b in balances.items()}
         return date_key, results
     except Exception:
         # Return empty/zeros on fatal error, or re-raise
@@ -148,6 +156,7 @@ def parse_args():
     parser.add_argument("--graph", "-g", action="store_true", help="Generate graph")
     parser.add_argument("--no-cache", action="store_true", help="Ignore block cache")
     parser.add_argument("--no-rewards", action="store_true", help="Skip fetching staking rewards")
+    parser.add_argument("--refetch-zero", action="store_true", help="Re-fetch if balance is zero")
     
     return parser.parse_args()
 
@@ -169,7 +178,7 @@ def find_blocks_for_dates(chain: ChainConnector, dates: list[date], cache: dict)
     
     print(f"  Finding blocks for {len(dates_to_find)} uncached dates (Parallel)...")
     
-    with ProcessPoolExecutor(max_workers=5, initializer=init_worker) as executor:
+    with ProcessPoolExecutor(max_workers=CONCURRENCY_DATES, initializer=init_worker) as executor:
         future_to_date = {executor.submit(_find_block_worker, d): d for d in dates_to_find}
         
         completed_count = 0
@@ -390,9 +399,9 @@ def main():
         if block_info:
             tasks.append((key, block_info["hash"]))
 
-    with ProcessPoolExecutor(max_workers=20, initializer=init_worker) as executor:
+    with ProcessPoolExecutor(max_workers=CONCURRENCY_BALANCES, initializer=init_worker) as executor:
         future_to_task = {
-            executor.submit(_fetch_balance_worker, key, block_hash, accounts): key 
+            executor.submit(_fetch_balance_worker, key, block_hash, accounts, args.refetch_zero): key 
             for key, block_hash in tasks
         }
         
@@ -463,6 +472,13 @@ def main():
                 try:
                     # Fetch rewards for this era/block range
                     rewards = reward_tracker.get_rewards_via_eras(accounts, start_hash, end_hash)
+                    
+                    # Logic match with Rust: if era-based fetching returns nothing, check if events exist
+                    total_amt = sum(r.claimed for r in rewards.values())
+                    if total_amt == 0:
+                        # Fallback to scanning events
+                        print(f"    No era rewards for {date_str}, scanning events...")
+                        rewards = reward_tracker.get_all_rewards_in_range(start_block, end_block, accounts)
                     
                     for name, reward in rewards.items():
                         if name not in reward_cache:

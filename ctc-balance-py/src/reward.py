@@ -1,18 +1,20 @@
-"""
-Staking reward tracking module for Creditcoin3.
-"""
-
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import date
 from substrateinterface import SubstrateInterface
 from src.chain import NODE_URL
+from src.utils import retry
 
 CTC_DECIMALS = 18
+CTC_DIVISOR = 10**CTC_DECIMALS
 
 class StakingReward:
     """Staking reward data."""
     def __init__(self, claimed: float = 0.0):
         self.claimed = claimed
+
+    @classmethod
+    def zero(cls):
+        return cls(0.0)
 
     def to_dict(self):
         return {"claimed": self.claimed}
@@ -20,9 +22,9 @@ class StakingReward:
 class RewardTracker:
     """Reward tracker for Creditcoin3 accounts."""
 
-    def __init__(self, url: str = NODE_URL):
+    def __init__(self, url: str = NODE_URL, substrate=None):
         self.url = url
-        self._substrate = None
+        self._substrate = substrate
 
     @property
     def substrate(self) -> SubstrateInterface:
@@ -58,137 +60,189 @@ class RewardTracker:
             return {}
 
         results = {name: 0.0 for name in accounts}
-        divisor = 10**CTC_DECIMALS
-
-        # Account ID mapping (SS58 to bytes and name)
-        # substrateinterface handles SS58, so we can use addresses directly
-        # but for internal mapping we might use bytes.
         
+        # Build lookup for fast address matching
+        # address -> name
+        address_to_name = {addr: name for name, addr in accounts.items()}
+
         for era in range(start_era, end_era + 1):
-            # 1. Get total era reward
-            total_reward_result = self.substrate.query(
-                module="Staking",
-                storage_function="ErasValidatorReward",
-                params=[era],
-                block_hash=end_block_hash
-            )
-            if not total_reward_result or not total_reward_result.value:
-                continue
-            total_reward_val = float(total_reward_result.value)
+            self._process_era_rewards(era, end_block_hash, address_to_name, results)
 
-            # 2. Get era reward points
-            points_result = self.substrate.query(
-                module="Staking",
-                storage_function="ErasRewardPoints",
-                params=[era],
-                block_hash=end_block_hash
-            )
-            if not points_result or not points_result.value:
+        return {name: StakingReward(claimed=amt / CTC_DIVISOR) for name, amt in results.items()}
+
+    def _process_era_rewards(self, era: int, block_hash: str, address_to_name: Dict[str, str], results: Dict[str, float]):
+        """Process a single era's rewards."""
+        # 1. Get total era reward
+        total_reward_result = self.substrate.query(
+            module="Staking",
+            storage_function="ErasValidatorReward",
+            params=[era],
+            block_hash=block_hash
+        )
+        if not total_reward_result or not total_reward_result.value:
+            return
+        total_reward_val = float(total_reward_result.value)
+        if total_reward_val == 0:
+            return
+
+        # 2. Get era reward points
+        points_result = self.substrate.query(
+            module="Staking",
+            storage_function="ErasRewardPoints",
+            params=[era],
+            block_hash=block_hash
+        )
+        if not points_result or not points_result.value:
+            return
+        
+        total_points = float(points_result.value.get("total", 0))
+        individual_points = points_result.value.get("individual", {})
+        
+        if total_points == 0:
+            return
+
+        # 3. Process each validator
+        if isinstance(individual_points, dict):
+            items = individual_points.items()
+        else:
+            items = individual_points
+
+        for v_address, p_v in items:
+            p_v = float(p_v)
+            if p_v == 0:
                 continue
+
+            # Validator's total reward share for this era
+            r_v_total = (total_reward_val * p_v) / total_points
             
-            total_points = float(points_result.value.get("total", 0))
-            individual_points = points_result.value.get("individual", {})
+            self._process_validator_reward(era, block_hash, v_address, r_v_total, address_to_name, results)
+
+    def _process_validator_reward(
+        self, 
+        era: int, 
+        block_hash: str, 
+        v_address: str, 
+        r_v_total: float, 
+        address_to_name: Dict[str, str], 
+        results: Dict[str, float]
+    ):
+        """Process a single validator's rewards."""
+        # Get validator commission
+        prefs_result = self.substrate.query(
+            module="Staking",
+            storage_function="ErasValidatorPrefs",
+            params=[era, v_address],
+            block_hash=block_hash
+        )
+        commission_ratio = 0.0
+        if prefs_result and prefs_result.value:
+            commission_ratio = float(prefs_result.value.get("commission", 0)) / 1_000_000_000.0
+
+        # Get validator exposure
+        exposure, is_paged = self._fetch_validator_exposure(era, v_address, block_hash)
+        if not exposure:
+            return
+
+        e_total = float(exposure.get("total", 0))
+        e_own = float(exposure.get("own", 0))
+        if e_total == 0:
+            return
+
+        # Case 1: Tracked account is the validator
+        if v_address in address_to_name:
+            name = address_to_name[v_address]
+            validator_reward = (r_v_total * commission_ratio) + \
+                               (r_v_total * (1.0 - commission_ratio) * (e_own / e_total))
+            results[name] += validator_reward
+
+        # Case 2: Tracked account is a nominator
+        others = exposure.get("others", [])
+        if is_paged and (page_count := exposure.get("page_count", 0)):
+            for page_idx in range(page_count):
+                paged_result = self.substrate.query(
+                    module="Staking",
+                    storage_function="ErasStakersPaged",
+                    params=[era, v_address, page_idx],
+                    block_hash=block_hash
+                )
+                if paged_result and paged_result.value:
+                    others.extend(paged_result.value.get("others", []))
+
+        for nominator in others:
+            n_address = nominator.get("who")
+            n_value = float(nominator.get("value", 0))
             
-            if total_points == 0 or total_reward_val == 0:
-                continue
+            if n_address in address_to_name:
+                name = address_to_name[n_address]
+                n_reward = r_v_total * (1.0 - commission_ratio) * (n_value / e_total)
+                results[name] += n_reward
 
-            # 3. For each validator who earned points
-            # individual_points can be dict or list of [address, points]
-            if isinstance(individual_points, dict):
-                items = individual_points.items()
-            else:
-                items = individual_points
+    def _fetch_validator_exposure(self, era: int, v_address: str, block_hash: str) -> Tuple[Optional[Dict], bool]:
+        """Fetch validator exposure (Overview/Paged or Clipped)."""
+        # Try ErasStakersOverview (Paged Staking)
+        res = self.substrate.query("Staking", "ErasStakersOverview", [era, v_address], block_hash=block_hash)
+        if res and res.value:
+            return res.value, True
+        
+        # Fallback to ErasStakersClipped
+        res = self.substrate.query("Staking", "ErasStakersClipped", [era, v_address], block_hash=block_hash)
+        if res and res.value:
+            return res.value, False
+            
+        return None, False
 
-            for item in items:
-                if isinstance(item, (list, tuple)):
-                    v_address, p_v = item
-                else:
-                    # If it's a dict entry (though unlikely if individual_points wasn't a dict)
-                    continue
-                
-                p_v = float(p_v)
-                if p_v == 0:
-                    continue
+    def get_all_rewards_in_range(
+        self, 
+        start_block: int, 
+        end_block: int, 
+        accounts: Dict[str, str]
+    ) -> Dict[str, StakingReward]:
+        """
+        Scan all blocks in range for Staking(Rewarded) events.
+        This is the fallback for historical rewards.
+        """
+        results = {name: 0.0 for name in accounts}
+        address_to_name = {addr: name for name, addr in accounts.items()}
+        
+        total_blocks = end_block - start_block + 1
+        processed = 0
 
-                # Validator's total reward share for this era
-                r_v_total = (total_reward_val * p_v) / total_points
+        for block_num in range(start_block, end_block + 1):
+            processed += 1
+            if total_blocks > 100 and (processed % 100 == 0 or processed == total_blocks):
+                print(f"    Scanning blocks: {processed * 100 // total_blocks}% ({processed}/{total_blocks})")
+            
+            self._process_block_events(block_num, address_to_name, results)
 
-                # 4. Get validator commission
-                prefs_result = self.substrate.query(
-                    module="Staking",
-                    storage_function="ErasValidatorPrefs",
-                    params=[era, v_address],
-                    block_hash=end_block_hash
-                )
-                commission_ratio = 0.0
-                if prefs_result and prefs_result.value:
-                    commission_ratio = float(prefs_result.value.get("commission", 0)) / 1_000_000_000.0
+        return {name: StakingReward(claimed=amt / CTC_DIVISOR) for name, amt in results.items()}
 
-                # 5. Get validator exposure (Overview or Clipped)
-                exposure = None
-                # Try ErasStakersOverview (Paged Staking)
-                exposure_result = self.substrate.query(
-                    module="Staking",
-                    storage_function="ErasStakersOverview",
-                    params=[era, v_address],
-                    block_hash=end_block_hash
-                )
-                
-                is_paged = False
-                if exposure_result and exposure_result.value:
-                    exposure = exposure_result.value
-                    is_paged = True
-                else:
-                    # Fallback to ErasStakersClipped (Legacy)
-                    exposure_result = self.substrate.query(
-                        module="Staking",
-                        storage_function="ErasStakersClipped",
-                        params=[era, v_address],
-                        block_hash=end_block_hash
-                    )
-                    if exposure_result and exposure_result.value:
-                        exposure = exposure_result.value
-
-                if not exposure:
-                    continue
-
-                e_total = float(exposure.get("total", 0))
-                e_own = float(exposure.get("own", 0))
-                if e_total == 0:
-                    continue
-
-                # Get nominators
-                others = exposure.get("others", [])
-                
-                # If paged, fetch from ErasStakersPaged
-                if is_paged and (page_count := exposure.get("page_count", 0)):
-                    for page_idx in range(page_count):
-                        paged_result = self.substrate.query(
-                            module="Staking",
-                            storage_function="ErasStakersPaged",
-                            params=[era, v_address, page_idx],
-                            block_hash=end_block_hash
-                        )
-                        if paged_result and paged_result.value:
-                            others.extend(paged_result.value.get("others", []))
-
-                # 6. Calculate rewards for our tracked accounts
-                
-                # Case 1: Tracked account is the validator
-                for name, address in accounts.items():
-                    if address == v_address:
-                        validator_reward = (r_v_total * commission_ratio) + \
-                                           (r_v_total * (1.0 - commission_ratio) * (e_own / e_total))
-                        results[name] += validator_reward
-
-                # Case 2: Tracked account is a nominator
-                for nominator in others:
-                    n_address = nominator.get("who")
-                    n_value = float(nominator.get("value", 0))
+    @retry(max_retries=3)
+    def _process_block_events(self, block_num: int, address_to_name: Dict[str, str], results: Dict[str, float]):
+        """Fetch and process events for a single block."""
+        block_hash = self.substrate.get_block_hash(block_num)
+        events = self.substrate.get_events(block_hash)
+        
+        for event in events:
+            # event is an EventRecord-like object from substrateinterface
+            if event.value['module_id'] == 'Staking' and event.value['event_id'] in ('Rewarded', 'Reward'):
+                # Params are usually (stash_address, amount)
+                params = event.value['params']
+                if len(params) >= 2:
+                    stash = params[0]['value']
+                    amount = int(params[1]['value'])
                     
-                    for name, address in accounts.items():
-                        if address == n_address:
-                            nominator_reward = r_v_total * (1.0 - commission_ratio) * (n_value / e_total)
-                            results[name] += nominator_reward
+                    if stash in address_to_name:
+                        name = address_to_name[stash]
+                        results[name] += amount
 
-        return {name: StakingReward(claimed=amt / divisor) for name, amt in results.items()}
+    def has_staking_events(self, block_num: int) -> bool:
+        """Check if a block contains any Staking(Rewarded/Reward) events."""
+        try:
+            block_hash = self.substrate.get_block_hash(block_num)
+            events = self.substrate.get_events(block_hash)
+            for event in events:
+                if event.value['module_id'] == 'Staking' and event.value['event_id'] in ('Rewarded', 'Reward'):
+                    return True
+        except Exception:
+            pass
+        return False
