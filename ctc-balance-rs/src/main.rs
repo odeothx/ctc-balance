@@ -571,6 +571,11 @@ async fn main() -> Result<()> {
             } else {
                 None
             },
+            if !args.no_rewards {
+                Some(&full_reward_history)
+            } else {
+                None
+            },
         )?;
     }
 

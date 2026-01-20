@@ -2,6 +2,7 @@
 //!
 //! Generates PNG graphs for balance history visualization.
 
+use crate::cache::RewardCache;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use plotters::prelude::*;
@@ -16,7 +17,8 @@ pub fn plot_balances<P: AsRef<Path>>(
     all_history: &HashMap<String, HashMap<String, f64>>,
     account_names: &[String],
     source_name: &str,
-    reward_history: Option<&HashMap<String, f64>>, // date -> total_reward
+    total_reward_history: Option<&HashMap<String, f64>>, // date -> total_reward
+    individual_reward_history: Option<&RewardCache>,     // account -> date -> reward
 ) -> Result<Vec<std::path::PathBuf>> {
     let path = output_file.as_ref();
     let mut generated_files = Vec::new();
@@ -81,7 +83,7 @@ pub fn plot_balances<P: AsRef<Path>>(
     let max_total: f64 = totals.iter().cloned().fold(0.0f64, |a, b| a.max(b));
 
     // Determine if we have reward data
-    let has_rewards = reward_history.is_some();
+    let has_rewards = total_reward_history.is_some();
     let graph_height = if has_rewards { 1400 } else { 1000 };
 
     // Create the main graph (2 or 3-panel)
@@ -162,8 +164,7 @@ pub fn plot_balances<P: AsRef<Path>>(
 
         // Middle panel: Total balance
         {
-            let x_range =
-                *date_objects.first().unwrap()..*date_objects.last().unwrap();
+            let x_range = *date_objects.first().unwrap()..*date_objects.last().unwrap();
             let y_max = max_total * 1.1;
 
             let mut chart = ChartBuilder::on(&panels.1)
@@ -194,7 +195,7 @@ pub fn plot_balances<P: AsRef<Path>>(
         }
 
         // Bottom panel: Daily rewards (if available)
-        if let (Some(reward_data), Some(bottom_panel)) = (reward_history, panels.2) {
+        if let (Some(reward_data), Some(bottom_panel)) = (total_reward_history, panels.2) {
             let rewards: Vec<f64> = dates
                 .iter()
                 .map(|d| reward_data.get(d).copied().unwrap_or(0.0))
@@ -269,8 +270,9 @@ pub fn plot_balances<P: AsRef<Path>>(
             continue;
         }
 
-        // Check if we have reward data for this account
-        let has_account_rewards = reward_history.is_some();
+        // Check if we have reward data
+        let has_account_rewards =
+            total_reward_history.is_some() || individual_reward_history.is_some();
         let graph_height = if has_account_rewards { 900 } else { 600 };
 
         let root = BitMapBackend::new(&individual_path, (1200, graph_height)).into_drawing_area();
@@ -319,11 +321,16 @@ pub fn plot_balances<P: AsRef<Path>>(
                 chart.draw_series(LineSeries::new(data, color.stroke_width(2)))?;
             }
 
-            // Lower panel: Rewards (using total rewards for this date)
-            if let Some(reward_data) = reward_history {
+            // Lower panel: Rewards (using account-specific rewards if available, else fallback to total)
+            let account_reward_data = individual_reward_history.and_then(|h| h.get(name));
+
+            if let Some(reward_map) =
+                account_reward_data.or(total_reward_history.and_then(|_| None))
+            {
+                // We have specific rewards for this account
                 let rewards: Vec<f64> = dates
                     .iter()
-                    .map(|d| reward_data.get(d).copied().unwrap_or(0.0))
+                    .map(|d| reward_map.get(d).copied().unwrap_or(0.0))
                     .collect();
 
                 let max_reward = rewards.iter().cloned().fold(0.0f64, |a, b| a.max(b)) * 1.2;
