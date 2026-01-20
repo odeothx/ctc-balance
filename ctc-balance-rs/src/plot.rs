@@ -109,8 +109,12 @@ pub fn plot_balances<P: AsRef<Path>>(
 
         // Upper panel: Individual balances
         {
-            let x_range =
-                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
+            let x_range = if date_objects.len() > 1 {
+                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone()
+            } else {
+                let d = date_objects[0];
+                d.pred_opt().unwrap_or(d)..d.succ_opt().unwrap_or(d)
+            };
             let y_max = max_individual * 1.1;
 
             let mut chart = ChartBuilder::on(&panels.0)
@@ -199,8 +203,12 @@ pub fn plot_balances<P: AsRef<Path>>(
             let max_reward = rewards.iter().cloned().fold(0.0f64, |a, b| a.max(b)) * 1.2;
             let max_reward = if max_reward <= 0.0 { 1.0 } else { max_reward };
 
-            let x_range =
-                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
+            let x_range = if date_objects.len() > 1 {
+                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone()
+            } else {
+                let d = date_objects[0];
+                d.pred_opt().unwrap_or(d)..d.succ_opt().unwrap_or(d)
+            };
 
             let mut chart = ChartBuilder::on(&bottom_panel)
                 .margin(40)
@@ -218,20 +226,18 @@ pub fn plot_balances<P: AsRef<Path>>(
 
             // Draw bars for each day
             let bar_color = RGBColor(76, 175, 80); // Green
-            let bar_width = chrono::Duration::hours(12);
 
-            let reward_data: Vec<(NaiveDate, f64)> = date_objects
-                .iter()
-                .cloned()
-                .zip(rewards.iter().cloned())
-                .filter(|(_, r)| *r > 0.0)
-                .collect();
-
-            chart.draw_series(reward_data.iter().map(|(date, reward)| {
-                let x0 = *date - bar_width;
-                let x1 = *date + bar_width;
-                Rectangle::new([(x0, 0.0), (x1, *reward)], bar_color.filled())
-            }))?;
+            chart.draw_series(
+                date_objects
+                    .iter()
+                    .zip(rewards.iter())
+                    .filter(|(_, r)| **r > 0.0)
+                    .map(|(date, reward)| {
+                        let x0 = *date;
+                        let x1 = date.succ_opt().unwrap_or(*date);
+                        Rectangle::new([(x0, 0.0), (x1, *reward)], bar_color.filled())
+                    }),
+            )?;
         }
 
         root.present()?;
@@ -270,7 +276,12 @@ pub fn plot_balances<P: AsRef<Path>>(
         let root = BitMapBackend::new(&individual_path, (1200, graph_height)).into_drawing_area();
         root.fill(&WHITE)?;
 
-        let x_range = date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
+        let x_range = if date_objects.len() > 1 {
+            date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone()
+        } else {
+            let d = date_objects[0];
+            d.pred_opt().unwrap_or(d)..d.succ_opt().unwrap_or(d)
+        };
 
         if has_account_rewards {
             // 2-panel layout: balance on top, reward on bottom
@@ -337,20 +348,18 @@ pub fn plot_balances<P: AsRef<Path>>(
 
                 // Draw bars for each day
                 let bar_color = RGBColor(76, 175, 80); // Green
-                let bar_width = chrono::Duration::hours(12);
 
-                let reward_data_filtered: Vec<(NaiveDate, f64)> = date_objects
-                    .iter()
-                    .cloned()
-                    .zip(rewards.iter().cloned())
-                    .filter(|(_, r)| *r > 0.0)
-                    .collect();
-
-                chart.draw_series(reward_data_filtered.iter().map(|(date, reward)| {
-                    let x0 = *date - bar_width;
-                    let x1 = *date + bar_width;
-                    Rectangle::new([(x0, 0.0), (x1, *reward)], bar_color.filled())
-                }))?;
+                chart.draw_series(
+                    date_objects
+                        .iter()
+                        .zip(rewards.iter())
+                        .filter(|(_, r)| **r > 0.0)
+                        .map(|(date, reward)| {
+                            let x0 = *date;
+                            let x1 = date.succ_opt().unwrap_or(*date);
+                            Rectangle::new([(x0, 0.0), (x1, *reward)], bar_color.filled())
+                        }),
+                )?;
             }
         } else {
             // Single panel: Balance only

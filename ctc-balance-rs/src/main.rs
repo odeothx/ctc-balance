@@ -21,7 +21,6 @@ use ctc_balance::{
     },
     plot::plot_balances,
     reward::RewardTracker,
-    subscan::SubscanClient,
     GENESIS_DATE, NODE_URL,
 };
 
@@ -69,10 +68,6 @@ struct Args {
     /// Ignore caches
     #[arg(long)]
     no_cache: bool,
-
-    /// Use Subscan API for rewards (faster than block scanning)
-    #[arg(long)]
-    subscan: bool,
 }
 
 #[tokio::main]
@@ -232,8 +227,8 @@ async fn main() -> Result<()> {
             !account_names.iter().all(|name| {
                 existing_data
                     .get(name)
-                    .map(|h| h.contains_key(date_str))
-                    .unwrap_or(false)
+                    .and_then(|h| h.get(date_str))
+                    .is_some()
             })
         })
         .collect();
@@ -275,7 +270,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 5. Fetch staking rewards - PARALLEL/CACHED or SUBSCAN API
+    // 5. Fetch staking rewards - BLOCK SCANNING
     let mut full_reward_history: RewardCache = HashMap::new();
     if !args.no_rewards {
         let reward_cache_file = output_dir.join("reward_cache.json");
@@ -285,115 +280,100 @@ async fn main() -> Result<()> {
             load_reward_cache(&reward_cache_file).unwrap_or_default()
         };
 
-        if args.subscan {
-            // Use Subscan API (much faster)
-            println!("\n[5/6] Fetching staking rewards via Subscan API...");
-            let subscan = SubscanClient::new();
-            
-            let daily_rewards = subscan
-                .get_all_daily_rewards(&accounts, start_date, end_date)
-                .await?;
-            
-            // Merge into cache
-            for (name, date_rewards) in daily_rewards {
-                let account_cache = reward_cache.entry(name).or_insert_with(HashMap::new);
-                for (date, reward) in date_rewards {
-                    account_cache.insert(date, reward);
+        println!("\n[5/6] Fetching staking rewards (block scanning)...");
+        let date_strings: Vec<String> = dates
+            .iter()
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .collect();
+        let mut missing_date_block_ranges = Vec::new();
+
+        for (i, date_str) in date_strings.iter().enumerate() {
+            let mut all_present = true;
+            for name in accounts.keys() {
+                if !reward_cache
+                    .get(name)
+                    .map(|h| h.contains_key(date_str))
+                    .unwrap_or(false)
+                {
+                    all_present = false;
+                    break;
                 }
             }
-            save_reward_cache(&reward_cache_file, &reward_cache).ok();
-            println!("  Rewards fetched via Subscan API!");
-        } else {
-            // Use block scanning (original method)
-            println!("\n[5/6] Fetching staking rewards (block scanning)...");
-            let date_strings: Vec<String> = dates
-                .iter()
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .collect();
-            let mut missing_date_block_ranges = Vec::new();
-
-            for (i, date_str) in date_strings.iter().enumerate() {
-                let mut all_present = true;
-                for name in accounts.keys() {
-                    if !reward_cache
-                        .get(name)
-                        .map(|h| h.contains_key(date_str))
-                        .unwrap_or(false)
-                    {
-                        all_present = false;
-                        break;
-                    }
-                }
-                if !all_present {
-                    if let Some(start_info) = cache.get(date_str) {
-                        let end_block = date_strings
-                            .get(i + 1)
-                            .and_then(|next_date| cache.get(next_date))
-                            .map(|b| b.block)
-                            .unwrap_or(start_info.block + 5760);
-                        missing_date_block_ranges.push((date_str.clone(), start_info.block, end_block));
-                    }
+            if !all_present {
+                if let Some(start_info) = cache.get(date_str) {
+                    let end_block = date_strings
+                        .get(i + 1)
+                        .and_then(|next_date| cache.get(next_date))
+                        .map(|b| b.block)
+                        .unwrap_or(start_info.block + 5760);
+                    missing_date_block_ranges.push((date_str.clone(), start_info.block, end_block));
                 }
             }
+        }
 
-            if !missing_date_block_ranges.is_empty() {
+        if !missing_date_block_ranges.is_empty() {
+            println!(
+                "  Fetching rewards for {} uncached dates...",
+                missing_date_block_ranges.len()
+            );
+            use futures::stream::{self, StreamExt};
+            let local_first = local_first_block;
+            let local_url = local_rpc_url.clone();
+
+            let mut stream = stream::iter(missing_date_block_ranges.iter())
+                .map(|(date_str, start_block, end_block)| {
+                    let rpc_url = match (&local_url, local_first) {
+                        (Some(url), Some(first)) if *start_block >= first => url.clone(),
+                        _ => NODE_URL.to_string(),
+                    };
+                    let mut tracker = RewardTracker::new(&rpc_url);
+                    let date_str = date_str.clone();
+                    let start = *start_block;
+                    let end = *end_block;
+                    let accounts = accounts.clone();
+                    async move {
+                        if tracker.connect().await.is_ok() {
+                            match tracker
+                                .get_rewards_via_eras(&accounts, start, end)
+                                .await
+                            {
+                                Ok(rewards) => (date_str, Some(rewards)),
+                                Err(e) => {
+                                    println!("    Warning: Era-based query failed for {}: {}. Falling back to scanning...", date_str, e);
+                                    match tracker.get_all_rewards_in_range(&accounts, start, end).await {
+                                        Ok(r) => (date_str, Some(r)),
+                                        Err(_) => (date_str, None),
+                                    }
+                                },
+                            }
+                        } else {
+                            (date_str, None)
+                        }
+                    }
+                })
+                .buffer_unordered(2);
+
+            let mut count = 0;
+            while let Some((date_str, rewards_opt)) = stream.next().await {
+                if let Some(rewards) = rewards_opt {
+                    for (name, reward) in rewards {
+                        reward_cache
+                            .entry(name)
+                            .or_insert_with(HashMap::new)
+                            .insert(date_str.clone(), reward.claimed);
+                    }
+                }
+                count += 1;
                 println!(
-                    "  Fetching rewards for {} uncached dates...",
+                    "    [{}/{}] dates processed",
+                    count,
                     missing_date_block_ranges.len()
                 );
-                use futures::stream::{self, StreamExt};
-                let local_first = local_first_block;
-                let local_url = local_rpc_url.clone();
-
-                let mut stream = stream::iter(missing_date_block_ranges.iter())
-                    .map(|(date_str, start_block, end_block)| {
-                        let rpc_url = match (&local_url, local_first) {
-                            (Some(url), Some(first)) if *start_block >= first => url.clone(),
-                            _ => NODE_URL.to_string(),
-                        };
-                        let mut tracker = RewardTracker::new(&rpc_url);
-                        let date_str = date_str.clone();
-                        let start = *start_block;
-                        let end = *end_block;
-                        let accounts = accounts.clone();
-                        async move {
-                            if tracker.connect().await.is_ok() {
-                                match tracker
-                                    .get_all_rewards_in_range(&accounts, start, end)
-                                    .await
-                                {
-                                    Ok(rewards) => (date_str, Some(rewards)),
-                                    Err(_) => (date_str, None),
-                                }
-                            } else {
-                                (date_str, None)
-                            }
-                        }
-                    })
-                    .buffer_unordered(2);
-
-                let mut count = 0;
-                while let Some((date_str, rewards_opt)) = stream.next().await {
-                    if let Some(rewards) = rewards_opt {
-                        for (name, reward) in rewards {
-                            reward_cache
-                                .entry(name)
-                                .or_insert_with(HashMap::new)
-                                .insert(date_str.clone(), reward.claimed);
-                        }
-                    }
-                    count += 1;
-                    println!(
-                        "    [{}/{}] dates processed",
-                        count,
-                        missing_date_block_ranges.len()
-                    );
-                    save_reward_cache(&reward_cache_file, &reward_cache).ok();
-                }
                 save_reward_cache(&reward_cache_file, &reward_cache).ok();
-            } else {
-                println!("  All rewards found in cache!");
             }
+            save_reward_cache(&reward_cache_file, &reward_cache).ok();
+        } else {
+            println!("  All rewards found in cache!");
         }
         full_reward_history = reward_cache;
     }

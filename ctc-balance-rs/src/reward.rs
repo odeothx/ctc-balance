@@ -1,12 +1,13 @@
 //! Staking reward tracking module for Creditcoin3.
 //!
-//! Queries Staking.Rewarded events from the chain to track daily rewards.
+//! Queries staking data from the chain to track rewards.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use subxt::{
     backend::{legacy::LegacyRpcMethods, rpc::RpcClient},
+    ext::scale_value::{Composite, Primitive, Value, ValueDef},
     OnlineClient, PolkadotConfig,
 };
 
@@ -15,7 +16,7 @@ use crate::CTC_DECIMALS;
 /// Staking reward data for an account
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StakingReward {
-    /// Claimed reward (from Staking.Rewarded events)
+    /// Claimed reward
     pub claimed: f64,
 }
 
@@ -82,29 +83,6 @@ impl RewardTracker {
             .context("Not connected. Call connect() first.")
     }
 
-    /// Check if events are available at a block
-    pub async fn has_events(&mut self, block: u64) -> bool {
-        if self.ensure_connected().await.is_err() {
-            return false;
-        }
-        let rpc = match self.rpc() {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-        let client = match self.client() {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-
-        match rpc.chain_get_block_hash(Some(block.into())).await {
-            Ok(Some(hash)) => match client.blocks().at(hash).await {
-                Ok(b) => b.events().await.is_ok(),
-                Err(_) => false,
-            },
-            _ => false,
-        }
-    }
-
     /// Get block hash for a block number
     pub async fn get_block_hash(&self, block_number: u64) -> Result<subxt::utils::H256> {
         let rpc = self.rpc()?;
@@ -115,22 +93,262 @@ impl RewardTracker {
         Ok(hash)
     }
 
-    /// Get staking rewards for an account in a block range
-    pub async fn get_rewards_in_range(
-        &mut self,
-        address: &str,
-        start_block: u64,
-        end_block: u64,
-    ) -> Result<StakingReward> {
-        let mut accounts = HashMap::new();
-        accounts.insert("default".to_string(), address.to_string());
-        let results = self
-            .get_all_rewards_in_range(&accounts, start_block, end_block)
+    /// Get active era at a specific block hash
+    pub async fn get_active_era(&self, block_hash: subxt::utils::H256) -> Result<u32> {
+        let client = self.client()?;
+        let storage_address = subxt::dynamic::storage("Staking", "ActiveEra", ());
+        let storage_value = client
+            .storage()
+            .at(block_hash)
+            .fetch(&storage_address)
             .await?;
-        Ok(results.get("default").cloned().unwrap_or_default())
+
+        if let Some(value) = storage_value {
+            let decoded = value.to_value()?;
+            if let ValueDef::Composite(Composite::Named(fields)) = decoded.value {
+                for (name, field) in fields {
+                    if name == "index" {
+                        if let ValueDef::Primitive(Primitive::U128(idx)) = field.value {
+                            return Ok(idx as u32);
+                        }
+                    }
+                }
+            }
+        }
+        anyhow::bail!("ActiveEra not found at block {:?}", block_hash)
     }
 
-    /// Get rewards for multiple accounts in a block range
+    /// Check if a block has staking events
+    pub async fn has_events(&mut self, block_number: u64) -> bool {
+        self.ensure_connected().await.ok();
+        if let Ok(hash) = self.get_block_hash(block_number).await {
+            if let Ok(client) = self.client() {
+                if let Ok(block) = client.blocks().at(hash).await {
+                    if let Ok(events) = block.events().await {
+                        for event in events.iter() {
+                            if let Ok(event) = event {
+                                if event.pallet_name() == "Staking"
+                                    && (event.variant_name() == "Rewarded"
+                                        || event.variant_name() == "Reward")
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Get rewards for accounts in a block range using Eras
+    pub async fn get_rewards_via_eras(
+        &mut self,
+        accounts: &HashMap<String, String>,
+        start_block: u64,
+        end_block: u64,
+    ) -> Result<HashMap<String, StakingReward>> {
+        self.ensure_connected().await?;
+        let client = self.client.clone().context("Client not initialized")?;
+
+        let start_hash = self.get_block_hash(start_block).await?;
+        let end_hash = self.get_block_hash(end_block).await?;
+
+        let start_era = self.get_active_era(start_hash).await.unwrap_or(0);
+        let end_era = self.get_active_era(end_hash).await.unwrap_or(0);
+
+        if start_era == 0 || end_era == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let divisor = 10u128.pow(CTC_DECIMALS) as f64;
+        let mut results = HashMap::new();
+        for name in accounts.keys() {
+            results.insert(name.clone(), 0.0);
+        }
+
+        let mut account_map: HashMap<[u8; 32], String> = HashMap::new();
+        for (name, address) in accounts {
+            if let Ok(id) = crate::parse_ss58_address(address) {
+                account_map.insert(id.0, name.clone());
+            }
+        }
+
+        for era in start_era..=end_era {
+            let total_reward_addr = subxt::dynamic::storage(
+                "Staking",
+                "ErasValidatorReward",
+                vec![subxt::dynamic::Value::u128(era as u128)],
+            );
+            let points_addr = subxt::dynamic::storage(
+                "Staking",
+                "ErasRewardPoints",
+                vec![subxt::dynamic::Value::u128(era as u128)],
+            );
+
+            let total_reward_val = match client
+                .storage()
+                .at(end_hash)
+                .fetch(&total_reward_addr)
+                .await?
+            {
+                Some(v) => {
+                    let val = v.to_value()?;
+                    match val.value {
+                        ValueDef::Primitive(Primitive::U128(r)) => r as f64,
+                        _ => 0.0,
+                    }
+                }
+                None => continue,
+            };
+
+            let points_data = match client.storage().at(end_hash).fetch(&points_addr).await? {
+                Some(v) => v.to_value()?,
+                None => continue,
+            };
+
+            let (total_points, validator_points) = parse_reward_points_def(points_data);
+
+            if total_points == 0.0 || total_reward_val == 0.0 {
+                continue;
+            }
+
+            use futures::stream::{self, StreamExt};
+            let validator_keys: Vec<[u8; 32]> = validator_points.keys().cloned().collect();
+
+            let mut stream = stream::iter(validator_keys)
+                .map(|v_bytes| {
+                    let client = client.clone();
+                    let v_bytes = v_bytes;
+                    async move {
+                        let exposure_addr = subxt::dynamic::storage(
+                            "Staking",
+                            "ErasStakersOverview",
+                            vec![
+                                subxt::dynamic::Value::u128(era as u128),
+                                subxt::dynamic::Value::from_bytes(v_bytes),
+                            ],
+                        );
+                        let legacy_exposure_addr = subxt::dynamic::storage(
+                            "Staking",
+                            "ErasStakersClipped",
+                            vec![
+                                subxt::dynamic::Value::u128(era as u128),
+                                subxt::dynamic::Value::from_bytes(v_bytes),
+                            ],
+                        );
+                        let prefs_addr = subxt::dynamic::storage(
+                            "Staking",
+                            "ErasValidatorPrefs",
+                            vec![
+                                subxt::dynamic::Value::u128(era as u128),
+                                subxt::dynamic::Value::from_bytes(v_bytes),
+                            ],
+                        );
+
+                        let exposure =
+                            match client.storage().at(end_hash).fetch(&exposure_addr).await {
+                                Ok(Some(e)) => Some(e),
+                                _ => client
+                                    .storage()
+                                    .at(end_hash)
+                                    .fetch(&legacy_exposure_addr)
+                                    .await
+                                    .ok()
+                                    .flatten(),
+                            };
+                        let prefs = client
+                            .storage()
+                            .at(end_hash)
+                            .fetch(&prefs_addr)
+                            .await
+                            .ok()
+                            .flatten();
+
+                        (v_bytes, exposure, prefs)
+                    }
+                })
+                .buffer_unordered(20);
+
+            while let Some((v_bytes, exposure_val, prefs_val)) = stream.next().await {
+                let p_v = *validator_points.get(&v_bytes).unwrap_or(&0.0);
+                if p_v == 0.0 {
+                    continue;
+                }
+
+                let r_v_total = (total_reward_val * p_v) / total_points;
+
+                let commission_ratio = if let Some(p) = prefs_val {
+                    let decoded = p.to_value()?;
+                    parse_commission_def(decoded)
+                } else {
+                    0.0
+                };
+
+                if let Some(e) = exposure_val {
+                    let decoded = e.to_value()?;
+                    let (e_total, e_own, mut nominators, page_count) = parse_exposure_def(decoded);
+
+                    if e_total == 0.0 {
+                        continue;
+                    }
+
+                    // If nominators is empty but page_count > 0, fetch from ErasStakersPaged
+                    if nominators.is_empty() && page_count > 0 {
+                        for page_idx in 0..page_count {
+                            let paged_addr = subxt::dynamic::storage(
+                                "Staking",
+                                "ErasStakersPaged",
+                                vec![
+                                    subxt::dynamic::Value::u128(era as u128),
+                                    subxt::dynamic::Value::from_bytes(v_bytes),
+                                    subxt::dynamic::Value::u128(page_idx as u128),
+                                ],
+                            );
+                            if let Ok(Some(page_val)) =
+                                client.storage().at(end_hash).fetch(&paged_addr).await
+                            {
+                                if let Ok(page_decoded) = page_val.to_value() {
+                                    let page_nominators = parse_paged_exposure(page_decoded);
+                                    nominators.extend(page_nominators);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(name) = account_map.get(&v_bytes) {
+                        let validator_reward = (r_v_total * commission_ratio)
+                            + (r_v_total * (1.0 - commission_ratio) * (e_own / e_total));
+                        *results.entry(name.clone()).or_insert(0.0) += validator_reward;
+                    }
+
+                    for (n_bytes, n_value) in nominators {
+                        if let Some(name) = account_map.get(&n_bytes) {
+                            let nominator_reward =
+                                r_v_total * (1.0 - commission_ratio) * (n_value / e_total);
+
+                            *results.entry(name.clone()).or_insert(0.0) += nominator_reward;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut final_results = HashMap::new();
+        for (name, amt) in results {
+            final_results.insert(
+                name,
+                StakingReward {
+                    claimed: amt / divisor,
+                },
+            );
+        }
+
+        Ok(final_results)
+    }
+
+    /// Fallback method using event scanning
     pub async fn get_all_rewards_in_range(
         &mut self,
         accounts: &HashMap<String, String>,
@@ -144,10 +362,9 @@ impl RewardTracker {
         let mut results = HashMap::new();
         let divisor = 10u128.pow(CTC_DECIMALS) as f64;
 
-        // Build account lookup map: [u8; 32] -> (Name, Total, SS58)
         let mut account_lookup: HashMap<[u8; 32], (String, u128, String)> = HashMap::new();
         for (name, address) in accounts {
-            if let Ok(account_id) = parse_ss58_address(address) {
+            if let Ok(account_id) = crate::parse_ss58_address(address) {
                 account_lookup.insert(account_id.0, (name.clone(), 0, address.clone()));
             }
         }
@@ -157,7 +374,6 @@ impl RewardTracker {
         let total_blocks = blocks.len();
 
         let mut processed_count = 0;
-
         let mut stream = stream::iter(blocks)
             .map(|block| {
                 let rpc = rpc.clone();
@@ -177,63 +393,40 @@ impl RewardTracker {
                     (block, events)
                 }
             })
-            .buffer_unordered(50); // Process 50 blocks in parallel
+            .buffer_unordered(50);
 
-        while let Some((block, events)) = stream.next().await {
+        while let Some((_block, events)) = stream.next().await {
             processed_count += 1;
-
             if total_blocks > 100 && (processed_count % 100 == 0 || processed_count == total_blocks)
             {
-                let percent = processed_count * 100 / total_blocks;
                 println!(
                     "    Scanning blocks: {}% ({}/{})",
-                    percent, processed_count, total_blocks
+                    processed_count * 100 / total_blocks,
+                    processed_count,
+                    total_blocks
                 );
             }
 
             if let Some(events) = events {
                 for event in events.iter() {
                     if let Ok(event) = event {
-                        let pallet = event.pallet_name();
-                        let variant = event.variant_name();
-
-                        if pallet == "Staking"
-                            || pallet == "StakingReward"
-                            || pallet == "Rewards"
-                            || pallet == "Creditstaking"
+                        if event.pallet_name() == "Staking"
+                            && (event.variant_name() == "Rewarded"
+                                || event.variant_name() == "Reward")
                         {
                             if let Ok(decoded) = event.field_values() {
-                                let is_reward_variant =
-                                    variant == "Rewarded" || variant == "Reward";
-
-                                if !is_reward_variant {
-                                    continue;
-                                }
-
-                                // Stringify only once per event
                                 let debug_str = format!("{:?}", decoded);
-
-                                // Extract stash field (validator/nominator account)
                                 let stash_str = extract_stash_field(&debug_str);
 
-                                for (account_bytes, (name, total, ss58_addr)) in
+                                for (account_bytes, (_id_name, total, ss58_addr)) in
                                     account_lookup.iter_mut()
                                 {
-                                    // Only match in stash field, not entire event
-                                    let matched = match_account_in_debug_str(
+                                    if match_account_in_debug_str(
                                         &stash_str,
                                         account_bytes,
                                         ss58_addr,
-                                    );
-
-                                    if matched {
-                                        if cfg!(debug_assertions) {
-                                            println!(
-                                                "  [DEBUG] Found {}.{} at block {}: stash={}",
-                                                pallet, variant, block, stash_str
-                                            );
-                                        }
-                                        let amount =
+                                    ) {
+                                        if let Some(amt) =
                                             parse_u128_from_debug(&debug_str, "amount")
                                                 .or_else(|| {
                                                     parse_u128_from_debug(&debug_str, "reward")
@@ -241,26 +434,9 @@ impl RewardTracker {
                                                 .or_else(|| {
                                                     parse_u128_from_debug(&debug_str, "value")
                                                 })
-                                                .or_else(|| {
-                                                    parse_u128_from_debug(&debug_str, "1")
-                                                })
-                                                .or_else(|| find_any_u128(&debug_str));
-
-                                        if let Some(amt) = amount {
-                                            if cfg!(debug_assertions) {
-                                                println!(
-                                                    "  [DEBUG] Matched account {} (stash) with reward {}",
-                                                    name, amt
-                                                );
-                                            }
+                                                .or_else(|| find_any_u128(&debug_str))
+                                        {
                                             *total += amt;
-                                        } else {
-                                            if cfg!(debug_assertions) {
-                                                println!(
-                                                    "  [DEBUG] Matched account {} but could not parse amount from: {}",
-                                                    name, debug_str
-                                                );
-                                            }
                                         }
                                     }
                                 }
@@ -271,8 +447,7 @@ impl RewardTracker {
             }
         }
 
-        // Build results
-        for (_account_bytes, (name, amount, _)) in account_lookup {
+        for (_bytes, (name, amount, _)) in account_lookup {
             results.insert(
                 name,
                 StakingReward {
@@ -280,24 +455,211 @@ impl RewardTracker {
                 },
             );
         }
-
         for name in accounts.keys() {
-            if !results.contains_key(name) {
-                results.insert(name.clone(), StakingReward::zero());
-            }
+            results.entry(name.clone()).or_insert(StakingReward::zero());
         }
 
         Ok(results)
     }
 }
 
-/// Extract the stash field from a Staking.Rewarded event debug string.
-/// The stash field contains the validator/nominator account.
+fn parse_reward_points_def(val: Value<u32>) -> (f64, HashMap<[u8; 32], f64>) {
+    let mut total = 0.0;
+    let mut map = HashMap::new();
+    if let ValueDef::Composite(Composite::Named(fields)) = val.value {
+        for (name, field) in fields {
+            if name == "total" {
+                if let ValueDef::Primitive(Primitive::U128(t)) = field.value {
+                    total = t as f64;
+                }
+            } else if name == "individual" {
+                // The individual field has an extra wrapper layer:
+                // individual -> Composite::Unnamed([wrapper]) -> validators...
+                if let ValueDef::Composite(Composite::Unnamed(outer_items)) = field.value {
+                    // Check for wrapper: if only 1 item and it's also Composite::Unnamed, unwrap it
+                    let validator_list: &[Value<u32>] = if outer_items.len() == 1 {
+                        if let ValueDef::Composite(Composite::Unnamed(ref inner)) =
+                            outer_items[0].value
+                        {
+                            inner.as_slice()
+                        } else {
+                            outer_items.as_slice()
+                        }
+                    } else {
+                        outer_items.as_slice()
+                    };
+
+                    for item in validator_list {
+                        if let ValueDef::Composite(Composite::Unnamed(ref pair)) = item.value {
+                            if pair.len() == 2 {
+                                if let Some(id) = extract_account_id_from_value(&pair[0]) {
+                                    if let ValueDef::Primitive(Primitive::U128(pts)) = pair[1].value
+                                    {
+                                        map.insert(id, pts as f64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (total, map)
+}
+
+fn parse_commission_def(val: Value<u32>) -> f64 {
+    if let ValueDef::Composite(Composite::Named(fields)) = val.value {
+        for (name, field) in fields {
+            if name == "commission" {
+                if let ValueDef::Primitive(Primitive::U128(com)) = field.value {
+                    return com as f64 / 1_000_000_000.0;
+                }
+            }
+        }
+    }
+    0.0
+}
+
+fn parse_exposure_def(val: Value<u32>) -> (f64, f64, Vec<([u8; 32], f64)>, u32) {
+    let mut total = 0.0;
+    let mut own = 0.0;
+    let mut others = Vec::new();
+    let mut page_count = 0u32;
+
+    if let ValueDef::Composite(Composite::Named(fields)) = val.value {
+        for (name, field) in fields {
+            match name.as_str() {
+                "total" => {
+                    if let ValueDef::Primitive(Primitive::U128(t)) = field.value {
+                        total = t as f64;
+                    }
+                }
+                "own" => {
+                    if let ValueDef::Primitive(Primitive::U128(o)) = field.value {
+                        own = o as f64;
+                    }
+                }
+                "page_count" => {
+                    if let ValueDef::Primitive(Primitive::U128(p)) = field.value {
+                        page_count = p as u32;
+                    }
+                }
+                "others" => {
+                    // Legacy ErasStakersClipped format - has inline nominators
+                    if let ValueDef::Composite(Composite::Unnamed(items)) = field.value {
+                        let nominator_list: &[Value<u32>] = if items.len() == 1 {
+                            if let ValueDef::Composite(Composite::Unnamed(ref inner)) =
+                                items[0].value
+                            {
+                                inner.as_slice()
+                            } else {
+                                items.as_slice()
+                            }
+                        } else {
+                            items.as_slice()
+                        };
+
+                        for item in nominator_list {
+                            if let ValueDef::Composite(Composite::Named(ifields)) = &item.value {
+                                let mut who = None;
+                                let mut value = 0.0;
+                                for (iname, ifield) in ifields {
+                                    if iname == "who" {
+                                        who = extract_account_id_from_value(&ifield);
+                                    } else if iname == "value" {
+                                        if let ValueDef::Primitive(Primitive::U128(v)) =
+                                            ifield.value
+                                        {
+                                            value = v as f64;
+                                        }
+                                    }
+                                }
+                                if let Some(w) = who {
+                                    others.push((w, value));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (total, own, others, page_count)
+}
+
+/// Parse a single page from ErasStakersPaged - returns list of (nominator_id, stake_value)
+fn parse_paged_exposure(val: Value<u32>) -> Vec<([u8; 32], f64)> {
+    let mut nominators = Vec::new();
+
+    // ErasStakersPaged structure: { page_total: u128, others: Vec<IndividualExposure> }
+    if let ValueDef::Composite(Composite::Named(fields)) = val.value {
+        for (name, field) in fields {
+            if name == "others" {
+                if let ValueDef::Composite(Composite::Unnamed(items)) = field.value {
+                    // Handle potential wrapper layer
+                    let nominator_list: &[Value<u32>] = if items.len() == 1 {
+                        if let ValueDef::Composite(Composite::Unnamed(ref inner)) = items[0].value {
+                            inner.as_slice()
+                        } else {
+                            items.as_slice()
+                        }
+                    } else {
+                        items.as_slice()
+                    };
+
+                    for item in nominator_list {
+                        if let ValueDef::Composite(Composite::Named(ifields)) = &item.value {
+                            let mut who = None;
+                            let mut value = 0.0;
+                            for (iname, ifield) in ifields {
+                                if iname == "who" {
+                                    who = extract_account_id_from_value(&ifield);
+                                } else if iname == "value" {
+                                    if let ValueDef::Primitive(Primitive::U128(v)) = ifield.value {
+                                        value = v as f64;
+                                    }
+                                }
+                            }
+                            if let Some(w) = who {
+                                nominators.push((w, value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    nominators
+}
+
+fn extract_account_id_from_value(val: &Value<u32>) -> Option<[u8; 32]> {
+    match &val.value {
+        ValueDef::Composite(Composite::Unnamed(items)) => {
+            if items.len() == 32 {
+                let mut bytes = [0u8; 32];
+                for (i, v) in items.iter().enumerate() {
+                    if let ValueDef::Primitive(Primitive::U128(b)) = v.value {
+                        bytes[i] = b as u8;
+                    } else {
+                        return None;
+                    }
+                }
+                Some(bytes)
+            } else if items.len() == 1 {
+                extract_account_id_from_value(&items[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn extract_stash_field(debug_str: &str) -> String {
-    // Look for ("stash", ...) pattern and extract everything until the next top-level field
     if let Some(stash_start) = debug_str.find("(\"stash\"") {
         let remaining = &debug_str[stash_start..];
-        // Find the matching closing paren by counting brackets
         let mut depth = 0;
         let mut end_pos = 0;
         for (i, c) in remaining.chars().enumerate() {
@@ -317,52 +679,19 @@ fn extract_stash_field(debug_str: &str) -> String {
             return remaining[..end_pos].to_string();
         }
     }
-    // Fallback: return the whole string if stash not found
     debug_str.to_string()
 }
 
-/// Extract the dest field from a Staking.Rewarded event debug string.
-/// The dest field contains the actual recipient of the reward.
-#[allow(dead_code)]
-fn extract_dest_field(debug_str: &str) -> String {
-    // Look for ("dest", ...) pattern and extract everything until the next top-level field
-    if let Some(dest_start) = debug_str.find("(\"dest\"") {
-        let remaining = &debug_str[dest_start..];
-        // Find the matching closing paren by counting brackets
-        let mut depth = 0;
-        let mut end_pos = 0;
-        for (i, c) in remaining.chars().enumerate() {
-            match c {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end_pos = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if end_pos > 0 {
-            return remaining[..end_pos].to_string();
-        }
-    }
-    // Fallback: return the whole string if dest not found
-    debug_str.to_string()
-}
-
-/// Parse a u128 value from debug string
 fn parse_u128_from_debug(debug_str: &str, field_name: &str) -> Option<u128> {
-    let pattern1 = format!("(\"{}\", Value", field_name);
-    let pattern2 = format!("\"{}\", Value", field_name);
-
-    for pattern in [&pattern1, &pattern2] {
-        if let Some(pos) = debug_str.find(pattern.as_str()) {
+    let patterns = [
+        format!("(\"{}\", Value", field_name),
+        format!("\"{}\", Value", field_name),
+    ];
+    for pattern in &patterns {
+        if let Some(pos) = debug_str.find(pattern) {
             let remaining = &debug_str[pos..];
             if let Some(u128_pos) = remaining.find("U128(") {
-                let after_u128 = &remaining[(u128_pos + 5)..];
-                let num_str: String = after_u128
+                let num_str: String = remaining[(u128_pos + 5)..]
                     .chars()
                     .take_while(|c| c.is_ascii_digit())
                     .collect();
@@ -372,58 +701,41 @@ fn parse_u128_from_debug(debug_str: &str, field_name: &str) -> Option<u128> {
             }
         }
     }
-
     None
 }
 
-/// Find any U128 value in the debug string
 fn find_any_u128(debug_str: &str) -> Option<u128> {
     let mut last_val = None;
     let mut current_pos = 0;
-
     while let Some(pos) = debug_str[current_pos..].find("U128(") {
         let abs_pos = current_pos + pos;
-        let after_u128 = &debug_str[(abs_pos + 5)..];
-        let num_str: String = after_u128
+        let num_str: String = debug_str[(abs_pos + 5)..]
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-
-        if !num_str.is_empty() {
-            if let Ok(val) = num_str.parse::<u128>() {
-                // Ignore small values that might be indices or contexts
-                if val > 1000 {
-                    last_val = Some(val);
-                }
+        if let Ok(val) = num_str.parse::<u128>() {
+            if val > 1000 {
+                last_val = Some(val);
             }
         }
         current_pos = abs_pos + 5 + num_str.len();
     }
-
     last_val
 }
 
-/// Match account in a debug string by looking for byte sequences or SS58
 fn match_account_in_debug_str(debug_str: &str, target_bytes: &[u8; 32], ss58_addr: &str) -> bool {
-    // 1. Try SS58 match
     if debug_str.contains(ss58_addr) {
         return true;
     }
-
-    // 2. Try hex match (0x prefix or not)
     let hex_addr = hex::encode(target_bytes);
     if debug_str.to_lowercase().contains(&hex_addr.to_lowercase()) {
         return true;
     }
-
-    // 3. Try byte sequence match U128(b1), U128(b2), ...
-    // Extract all numbers after U128(
     let mut values = Vec::new();
     let mut current_pos = 0;
     while let Some(pos) = debug_str[current_pos..].find("U128(") {
         let abs_pos = current_pos + pos;
-        let after_u128 = &debug_str[(abs_pos + 5)..];
-        let num_str: String = after_u128
+        let num_str: String = debug_str[(abs_pos + 5)..]
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
@@ -432,8 +744,6 @@ fn match_account_in_debug_str(debug_str: &str, target_bytes: &[u8; 32], ss58_add
         }
         current_pos = abs_pos + 5 + num_str.len();
     }
-
-    // Check if target_bytes appears as a subsequence in values
     if values.len() >= 32 {
         for i in 0..=(values.len() - 32) {
             let mut matched = true;
@@ -448,88 +758,5 @@ fn match_account_in_debug_str(debug_str: &str, target_bytes: &[u8; 32], ss58_add
             }
         }
     }
-
     false
-}
-
-/// Parse SS58 address to AccountId32
-fn parse_ss58_address(address: &str) -> Result<subxt::utils::AccountId32> {
-    use std::str::FromStr;
-    subxt::utils::AccountId32::from_str(address)
-        .map_err(|e| anyhow::anyhow!("Invalid SS58 address '{}': {}", address, e))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_staking_reward_default() {
-        let reward = StakingReward::default();
-        assert_eq!(reward.claimed, 0.0);
-    }
-
-    #[test]
-    fn test_staking_reward_zero() {
-        let reward = StakingReward::zero();
-        assert_eq!(reward.claimed, 0.0);
-    }
-
-    #[test]
-    fn test_parse_u128() {
-        let debug_str = r#"[("stash", Value { value: Primitive(U128(12345)) }), ("amount", Value { value: Primitive(U128(67890)) })]"#;
-        assert_eq!(parse_u128_from_debug(debug_str, "amount"), Some(67890));
-        assert_eq!(parse_u128_from_debug(debug_str, "stash"), Some(12345));
-
-        let tuple_str = r#"[("0", Value { value: Primitive(U128(111)) }), ("1", Value { value: Primitive(U128(222)) })]"#;
-        assert_eq!(parse_u128_from_debug(tuple_str, "0"), Some(111));
-        assert_eq!(parse_u128_from_debug(tuple_str, "1"), Some(222));
-    }
-
-    #[test]
-    fn test_find_any_u128() {
-        let debug_str = r#"[("stash", Value { value: Primitive(U128(12345)) }), ("amount", Value { value: Primitive(U128(67890)) })]"#;
-        // Should find the last one (amount)
-        assert_eq!(find_any_u128(debug_str), Some(67890));
-
-        let single = r#"[("value", Value { value: Primitive(U128(5000)) })]"#;
-        assert_eq!(find_any_u128(single), Some(5000));
-    }
-
-    #[test]
-    fn test_match_account_in_debug_str() {
-        let mut target = [0u8; 32];
-        target[0] = 198;
-        target[1] = 152;
-        target[31] = 40;
-
-        let ss58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-
-        // 1. SS58 match
-        assert!(match_account_in_debug_str(
-            "stash: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-            &target,
-            ss58
-        ));
-
-        // 2. Hex match
-        assert!(match_account_in_debug_str(
-            "stash: 0xc698000000000000000000000000000000000000000000000000000000000028",
-            &target,
-            ss58
-        ));
-
-        // 3. Byte sequence match
-        let debug_str = "U128(198), U128(152), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(0), U128(40)";
-        assert!(match_account_in_debug_str(debug_str, &target, ss58));
-
-        // 4. No match
-        assert!(!match_account_in_debug_str("nothing", &target, ss58));
-    }
-
-    #[test]
-    fn test_parse_ss58() {
-        let addr = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-        assert!(parse_ss58_address(addr).is_ok());
-    }
 }

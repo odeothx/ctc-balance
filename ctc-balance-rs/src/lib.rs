@@ -9,8 +9,6 @@ pub mod chain;
 pub mod csv_output;
 pub mod plot;
 pub mod reward;
-pub mod subscan;
-
 pub use accounts::load_accounts;
 pub use balance::{Balance, BalanceTracker};
 pub use cache::{
@@ -19,7 +17,6 @@ pub use cache::{
 };
 pub use chain::ChainConnector;
 pub use reward::{RewardTracker, StakingReward};
-pub use subscan::SubscanClient;
 
 /// Creditcoin3 mainnet genesis date (2024-08-29)
 pub const GENESIS_DATE: &str = "2024-08-29";
@@ -32,3 +29,10 @@ pub const BLOCK_TIME_SECONDS: u64 = 15;
 
 /// Default RPC URL
 pub const NODE_URL: &str = "wss://mainnet3.creditcoin.network";
+
+/// Parse SS58 address to AccountId32
+pub fn parse_ss58_address(address: &str) -> anyhow::Result<subxt::utils::AccountId32> {
+    use std::str::FromStr;
+    subxt::utils::AccountId32::from_str(address)
+        .map_err(|e| anyhow::anyhow!("Invalid SS58 address '{}': {}", address, e))
+}

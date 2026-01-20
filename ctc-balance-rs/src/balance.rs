@@ -106,7 +106,7 @@ impl BalanceTracker {
         let block_hash = subxt::utils::H256::from(hash);
 
         // Parse address as AccountId32
-        let account_id = parse_ss58_address(address)?;
+        let account_id = crate::parse_ss58_address(address)?;
 
         // Convert AccountId32 to dynamic Value for storage key
         let account_value = subxt::dynamic::Value::from_bytes(account_id.0);
@@ -167,15 +167,17 @@ impl BalanceTracker {
 
             tasks.push(tokio::spawn(async move {
                 let res = tracker.get_balance(&address, &block_hash_task).await;
-                (name, res.unwrap_or_else(|_| Balance::zero()))
+                (name, res)
             }));
         }
 
         let results = futures::future::join_all(tasks).await;
         let mut balances = HashMap::new();
         for res in results {
-            if let Ok((name, balance)) = res {
-                balances.insert(name, balance);
+            if let Ok((name, balance_res)) = res {
+                if let Ok(balance) = balance_res {
+                    balances.insert(name, balance);
+                }
             }
         }
 
@@ -214,11 +216,7 @@ fn parse_field_value(debug_str: &str, field_name: &str) -> Option<u128> {
 }
 
 /// Parse SS58 address to AccountId32
-fn parse_ss58_address(address: &str) -> Result<subxt::utils::AccountId32> {
-    use std::str::FromStr;
-    subxt::utils::AccountId32::from_str(address)
-        .map_err(|e| anyhow::anyhow!("Invalid SS58 address '{}': {}", address, e))
-}
+// Moved to lib.rs
 
 #[cfg(test)]
 mod tests {
@@ -244,11 +242,11 @@ mod tests {
     fn test_parse_ss58_address() {
         // Valid SS58 address (Creditcoin/Substrate)
         let addr = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-        assert!(parse_ss58_address(addr).is_ok());
+        assert!(crate::parse_ss58_address(addr).is_ok());
 
         // Invalid address
         let invalid_addr = "invalid";
-        assert!(parse_ss58_address(invalid_addr).is_err());
+        assert!(crate::parse_ss58_address(invalid_addr).is_err());
     }
 
     #[test]
