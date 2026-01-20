@@ -17,7 +17,7 @@ import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from filelock import FileLock
 
 import matplotlib
@@ -48,6 +48,7 @@ REWARD_CACHE_FILE = OUTPUT_DIR / "reward_cache.json"
 # Concurrency Constants (Matched with Rust version)
 CONCURRENCY_DATES = 5
 CONCURRENCY_BALANCES = 3
+CONCURRENCY_REWARDS = 2  # For parallel reward fetching
 
 
 def format_ctc(amount: float) -> str:
@@ -148,6 +149,41 @@ def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict, refetc
         return date_key, {name: 0.0 for name in accounts}
 
 
+def _fetch_reward_worker(
+    date_str: str, 
+    start_block: int, 
+    end_block: int, 
+    start_hash: str, 
+    end_hash: str, 
+    accounts: dict
+) -> tuple[str, dict]:
+    """Worker for fetching rewards in parallel (uses thread, not process)."""
+    from src.reward import RewardTracker
+    
+    reward_tracker = RewardTracker()
+    result = {}
+    
+    try:
+        # Fetch rewards for this era/block range
+        rewards = reward_tracker.get_rewards_via_eras(accounts, start_hash, end_hash)
+        
+        # Logic match with Rust: if era-based fetching returns nothing, check if events exist
+        total_amt = sum(r.claimed for r in rewards.values())
+        if total_amt == 0:
+            # Fallback to scanning events
+            rewards = reward_tracker.get_all_rewards_in_range(start_block, end_block, accounts)
+        
+        for name, reward in rewards.items():
+            result[name] = round(reward.claimed, 2)
+        
+        return date_str, result
+    except Exception as e:
+        logger.warning(f"Failed to fetch rewards for {date_str}: {e}")
+        return date_str, {name: 0.0 for name in accounts}
+    finally:
+        reward_tracker.close()
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -167,6 +203,7 @@ def parse_args():
     parser.add_argument("--no-cache", action="store_true", help="Ignore block cache")
     parser.add_argument("--no-rewards", action="store_true", help="Skip fetching staking rewards")
     parser.add_argument("--refetch-zero", action="store_true", help="Re-fetch if balance is zero")
+    parser.add_argument("--local-rpc", help="Local RPC URL for faster access to recent blocks")
     
     return parser.parse_args()
 
@@ -431,15 +468,13 @@ def main():
                 total = sum(balances.values())
                 print(f"  [{completed}/{total_tasks}] {key} completed")
 
-    # 4.5. Staking Rewards 조회
+    # 5. Staking Rewards 조회 (Parallel)
     reward_history = {name: {} for name in accounts}
     if not args.no_rewards:
         print("\n[5/6] Fetching staking rewards...")
         reward_cache = {} if args.no_cache else load_reward_cache()
         
-        reward_tracker = RewardTracker()
-        
-        # Determine uncached dates
+        # Determine uncached dates and build task list
         uncached_dates = []
         for i, d in enumerate(dates):
             date_str = d.isoformat()
@@ -455,17 +490,19 @@ def main():
                 uncached_dates.append((i, date_str))
         
         if uncached_dates:
-            print(f"  Fetching rewards for {len(uncached_dates)} uncached dates...")
+            print(f"  Fetching rewards for {len(uncached_dates)} uncached dates (Parallel)...")
+            
+            # Build task list with block ranges
+            reward_tasks = []
             for idx, date_str in uncached_dates:
                 block_info = block_map.get(date_str)
                 if not block_info:
                     continue
                 
-                # Get block range for this date
                 start_block = block_info["block"]
                 start_hash = block_info["hash"]
                 
-                # Next day's block or +BLOCKS_PER_DAY (1 day of blocks)
+                # Next day's block or +BLOCKS_PER_DAY
                 if idx + 1 < len(dates):
                     next_date_str = dates[idx+1].isoformat()
                     next_block_info = block_map.get(next_date_str)
@@ -479,26 +516,31 @@ def main():
                     end_block = start_block + BLOCKS_PER_DAY
                     end_hash = chain.get_block_hash(end_block)
                 
-                try:
-                    # Fetch rewards for this era/block range
-                    rewards = reward_tracker.get_rewards_via_eras(accounts, start_hash, end_hash)
+                reward_tasks.append((date_str, start_block, end_block, start_hash, end_hash, dict(accounts)))
+            
+            # Execute in parallel using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=CONCURRENCY_REWARDS) as executor:
+                future_to_date = {
+                    executor.submit(_fetch_reward_worker, *task): task[0] 
+                    for task in reward_tasks
+                }
+                
+                completed = 0
+                for future in as_completed(future_to_date):
+                    date_str, rewards = future.result()
                     
-                    # Logic match with Rust: if era-based fetching returns nothing, check if events exist
-                    total_amt = sum(r.claimed for r in rewards.values())
-                    if total_amt == 0:
-                        # Fallback to scanning events
-                        print(f"    No era rewards for {date_str}, scanning events...")
-                        rewards = reward_tracker.get_all_rewards_in_range(start_block, end_block, accounts)
-                    
-                    for name, reward in rewards.items():
+                    # Update cache
+                    for name, reward_val in rewards.items():
                         if name not in reward_cache:
                             reward_cache[name] = {}
-                        reward_cache[name][date_str] = round(reward.claimed, 2)
-                        
-                    print(f"    {date_str} rewards fetched")
-                    save_reward_cache(reward_cache)
-                except Exception as e:
-                    print(f"    Warning: Failed to fetch rewards for {date_str}: {e}")
+                        reward_cache[name][date_str] = reward_val
+                    
+                    completed += 1
+                    if completed % 5 == 0 or completed == len(reward_tasks):
+                        print(f"  [{completed}/{len(reward_tasks)}] rewards fetched")
+                        save_reward_cache(reward_cache)
+            
+            save_reward_cache(reward_cache)
         else:
             print("  All rewards found in cache!")
             
