@@ -68,6 +68,10 @@ struct Args {
     /// Ignore caches
     #[arg(long)]
     no_cache: bool,
+
+    /// Re-fetch and overwrite entries with zero balance
+    #[arg(long)]
+    refetch_zero: bool,
 }
 
 #[tokio::main]
@@ -224,12 +228,33 @@ async fn main() -> Result<()> {
         .iter()
         .map(|d| d.format("%Y-%m-%d").to_string())
         .filter(|date_str| {
-            !account_names.iter().all(|name| {
+            // 1. Always fetch if any account is missing data for this date
+            let any_missing = account_names.iter().any(|name| {
                 existing_data
                     .get(name)
                     .and_then(|h| h.get(date_str))
-                    .is_some()
-            })
+                    .is_none()
+            });
+            if any_missing {
+                return true;
+            }
+
+            // 2. If refetch_zero is enabled, fetch if ALL accounts have 0.0 balance
+            // This avoids re-fetching dates where some accounts legitimately have 0.0
+            if args.refetch_zero {
+                let all_zero = account_names.iter().all(|name| {
+                    existing_data
+                        .get(name)
+                        .and_then(|h| h.get(date_str))
+                        .map(|&v| v == 0.0)
+                        .unwrap_or(true)
+                });
+                if all_zero {
+                    return true;
+                }
+            }
+
+            false
         })
         .collect();
 
@@ -254,19 +279,41 @@ async fn main() -> Result<()> {
             .buffer_unordered(3);
 
         let mut count = 0;
+        let mut failed_dates = Vec::new();
         while let Some((date_str, res_opt)) = stream.next().await {
-            if let Some(Ok(balances)) = res_opt {
-                for (name, balance) in balances {
-                    existing_data
-                        .entry(name)
-                        .or_insert_with(HashMap::new)
-                        .insert(date_str.clone(), balance.free);
+            match res_opt {
+                Some(Ok(balances)) => {
+                    for (name, balance) in balances {
+                        existing_data
+                            .entry(name)
+                            .or_insert_with(HashMap::new)
+                            .insert(date_str.clone(), balance.free);
+                    }
+                }
+                Some(Err(e)) => {
+                    println!(
+                        "    Warning: Failed to fetch balances for {}: {}",
+                        date_str, e
+                    );
+                    failed_dates.push(date_str);
+                }
+                None => {
+                    println!("    Warning: Missing block info for {}", date_str);
+                    failed_dates.push(date_str);
                 }
             }
             count += 1;
             if count % 10 == 0 || count == dates_to_fetch.len() {
                 println!("  [{}/{}] completed", count, dates_to_fetch.len());
             }
+        }
+
+        if !failed_dates.is_empty() {
+            println!(
+                "\n  Caution: {} dates failed to fetch. These will appear as 0.0 in the output.",
+                failed_dates.len()
+            );
+            println!("  Try running again to retry these dates.");
         }
     }
 
@@ -290,11 +337,12 @@ async fn main() -> Result<()> {
         for (i, date_str) in date_strings.iter().enumerate() {
             let mut all_present = true;
             for name in accounts.keys() {
-                if !reward_cache
+                let present = reward_cache
                     .get(name)
                     .map(|h| h.contains_key(date_str))
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+
+                if !present {
                     all_present = false;
                     break;
                 }

@@ -36,3 +36,29 @@ pub fn parse_ss58_address(address: &str) -> anyhow::Result<subxt::utils::Account
     subxt::utils::AccountId32::from_str(address)
         .map_err(|e| anyhow::anyhow!("Invalid SS58 address '{}': {}", address, e))
 }
+
+/// Centralized retry macro with exponential backoff
+#[macro_export]
+macro_rules! retry {
+    ($logic:expr) => {{
+        let mut retry_count = 0;
+        let max_retries = 3;
+        loop {
+            match $logic.await {
+                Ok(val) => break Ok(val),
+                Err(e) => {
+                    if retry_count >= max_retries {
+                        break Err(anyhow::anyhow!(
+                            "Operation failed after {} retries: {}",
+                            max_retries,
+                            e
+                        ));
+                    }
+                    retry_count += 1;
+                    let delay = 100 * 2u64.pow(retry_count as u32);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }};
+}

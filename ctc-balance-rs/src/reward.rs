@@ -97,11 +97,7 @@ impl RewardTracker {
     pub async fn get_active_era(&self, block_hash: subxt::utils::H256) -> Result<u32> {
         let client = self.client()?;
         let storage_address = subxt::dynamic::storage("Staking", "ActiveEra", ());
-        let storage_value = client
-            .storage()
-            .at(block_hash)
-            .fetch(&storage_address)
-            .await?;
+        let storage_value = crate::retry!(client.storage().at(block_hash).fetch(&storage_address))?;
 
         if let Some(value) = storage_value {
             let decoded = value.to_value()?;
@@ -121,9 +117,11 @@ impl RewardTracker {
     /// Check if a block has staking events
     pub async fn has_events(&mut self, block_number: u64) -> bool {
         self.ensure_connected().await.ok();
-        if let Ok(hash) = self.get_block_hash(block_number).await {
+        let hash_res = crate::retry!(async { self.get_block_hash(block_number).await });
+
+        if let Ok(hash) = hash_res {
             if let Ok(client) = self.client() {
-                if let Ok(block) = client.blocks().at(hash).await {
+                if let Ok(block) = crate::retry!(client.blocks().at(hash)) {
                     if let Ok(events) = block.events().await {
                         for event in events.iter() {
                             if let Ok(event) = event {
@@ -187,26 +185,23 @@ impl RewardTracker {
                 vec![subxt::dynamic::Value::u128(era as u128)],
             );
 
-            let total_reward_val = match client
-                .storage()
-                .at(end_hash)
-                .fetch(&total_reward_addr)
-                .await?
-            {
-                Some(v) => {
-                    let val = v.to_value()?;
-                    match val.value {
-                        ValueDef::Primitive(Primitive::U128(r)) => r as f64,
-                        _ => 0.0,
+            let total_reward_val =
+                match crate::retry!(client.storage().at(end_hash).fetch(&total_reward_addr))? {
+                    Some(v) => {
+                        let val = v.to_value()?;
+                        match val.value {
+                            ValueDef::Primitive(Primitive::U128(r)) => r as f64,
+                            _ => 0.0,
+                        }
                     }
-                }
-                None => continue,
-            };
+                    None => continue,
+                };
 
-            let points_data = match client.storage().at(end_hash).fetch(&points_addr).await? {
-                Some(v) => v.to_value()?,
-                None => continue,
-            };
+            let points_data =
+                match crate::retry!(client.storage().at(end_hash).fetch(&points_addr))? {
+                    Some(v) => v.to_value()?,
+                    None => continue,
+                };
 
             let (total_points, validator_points) = parse_reward_points_def(points_data);
 
@@ -247,22 +242,20 @@ impl RewardTracker {
                             ],
                         );
 
-                        let exposure =
-                            match client.storage().at(end_hash).fetch(&exposure_addr).await {
-                                Ok(Some(e)) => Some(e),
-                                _ => client
-                                    .storage()
-                                    .at(end_hash)
-                                    .fetch(&legacy_exposure_addr)
-                                    .await
-                                    .ok()
-                                    .flatten(),
-                            };
-                        let prefs = client
+                        let exposure = match crate::retry!(client
                             .storage()
                             .at(end_hash)
-                            .fetch(&prefs_addr)
-                            .await
+                            .fetch(&exposure_addr))
+                        {
+                            Ok(Some(e)) => Some(e),
+                            _ => crate::retry!(client
+                                .storage()
+                                .at(end_hash)
+                                .fetch(&legacy_exposure_addr))
+                            .ok()
+                            .flatten(),
+                        };
+                        let prefs = crate::retry!(client.storage().at(end_hash).fetch(&prefs_addr))
                             .ok()
                             .flatten();
 
@@ -307,7 +300,7 @@ impl RewardTracker {
                                 ],
                             );
                             if let Ok(Some(page_val)) =
-                                client.storage().at(end_hash).fetch(&paged_addr).await
+                                crate::retry!(client.storage().at(end_hash).fetch(&paged_addr))
                             {
                                 if let Ok(page_decoded) = page_val.to_value() {
                                     let page_nominators = parse_paged_exposure(page_decoded);
@@ -379,11 +372,11 @@ impl RewardTracker {
                 let rpc = rpc.clone();
                 let client = client.clone();
                 async move {
-                    let hash = match rpc.chain_get_block_hash(Some(block.into())).await {
+                    let hash = match crate::retry!(rpc.chain_get_block_hash(Some(block.into()))) {
                         Ok(Some(h)) => h,
                         _ => return (block, None),
                     };
-                    let events = match client.blocks().at(hash).await {
+                    let events = match crate::retry!(client.blocks().at(hash)) {
                         Ok(b) => match b.events().await {
                             Ok(e) => Some(e),
                             Err(_) => None,

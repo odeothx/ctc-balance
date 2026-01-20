@@ -114,11 +114,7 @@ impl BalanceTracker {
         // Query System.Account storage using dynamic address
         let storage_address = subxt::dynamic::storage("System", "Account", vec![account_value]);
 
-        let storage_value = client
-            .storage()
-            .at(block_hash)
-            .fetch(&storage_address)
-            .await?;
+        let storage_value = crate::retry!(client.storage().at(block_hash).fetch(&storage_address))?;
 
         match storage_value {
             Some(value) => {
@@ -174,11 +170,9 @@ impl BalanceTracker {
         let results = futures::future::join_all(tasks).await;
         let mut balances = HashMap::new();
         for res in results {
-            if let Ok((name, balance_res)) = res {
-                if let Ok(balance) = balance_res {
-                    balances.insert(name, balance);
-                }
-            }
+            let (name, balance_res) = res.context("Join error in get_all_balances")?;
+            let balance = balance_res?;
+            balances.insert(name, balance);
         }
 
         Ok(balances)

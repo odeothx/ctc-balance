@@ -114,9 +114,7 @@ impl ChainConnector {
         self.ensure_connected().await?;
         let rpc = self.rpc()?;
 
-        let hash = rpc
-            .chain_get_block_hash(Some(block_number.into()))
-            .await?
+        let hash = crate::retry!(rpc.chain_get_block_hash(Some(block_number.into())))?
             .context(format!("Block {} not found", block_number))?;
 
         Ok(format!("{:?}", hash))
@@ -127,8 +125,7 @@ impl ChainConnector {
         self.ensure_connected().await?;
         let rpc = self.rpc()?;
 
-        let header = rpc.chain_get_header(None).await?.context("No header")?;
-
+        let header = crate::retry!(rpc.chain_get_header(None))?.context("No header")?;
         Ok(header.number as u64)
     }
 
@@ -148,11 +145,7 @@ impl ChainConnector {
         // Query Timestamp.Now storage
         let storage_address = subxt::dynamic::storage("Timestamp", "Now", ());
 
-        let storage_value = client
-            .storage()
-            .at(block_hash)
-            .fetch(&storage_address)
-            .await?
+        let storage_value = crate::retry!(client.storage().at(block_hash).fetch(&storage_address))?
             .context("Timestamp not found")?;
 
         // Decode as u64 (milliseconds)
