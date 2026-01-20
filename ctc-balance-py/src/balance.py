@@ -2,15 +2,17 @@
 Balance query module for Creditcoin3 accounts.
 """
 
+import logging
 from dataclasses import dataclass
 from src.chain import ChainConnector
-
-
 from src.utils import retry
 
 # CTC 단위
 CTC_DECIMALS = 18
 CTC_DIVISOR = 10**CTC_DECIMALS
+EPSILON = 1e-10  # For safe float comparison
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,7 +46,11 @@ class BalanceTracker:
 
     @retry(max_retries=3)
     def get_balance(
-        self, address: str, block_hash: str | None = None, force_refetch: bool = False
+        self, 
+        address: str, 
+        block_hash: str | None = None, 
+        force_refetch: bool = False,
+        _depth: int = 0  # Recursion guard
     ) -> Balance:
         """
         Get account balance at a specific block.
@@ -53,6 +59,7 @@ class BalanceTracker:
             address: Account SS58 address
             block_hash: Block hash (None for latest)
             force_refetch: If balance is 0, try fetching from finalized head
+            _depth: Internal recursion guard (do not set manually)
 
         Returns:
             Balance object
@@ -69,11 +76,12 @@ class BalanceTracker:
         reserved = int(data["reserved"]) / CTC_DIVISOR
         frozen = int(data.get("frozen", 0)) / CTC_DIVISOR
 
-        if free == 0.0 and reserved == 0.0 and force_refetch:
+        # Safe float comparison with epsilon, and recursion guard
+        if free < EPSILON and reserved < EPSILON and force_refetch and _depth < 1:
             # Try once more with finalized head to be sure
             latest_hash = self.chain.substrate.get_block_hash()
             if latest_hash != block_hash:
-                return self.get_balance(address, latest_hash, force_refetch=False)
+                return self.get_balance(address, latest_hash, force_refetch=False, _depth=_depth + 1)
 
         return Balance(free=free, reserved=reserved, frozen=frozen)
 
@@ -99,6 +107,7 @@ class BalanceTracker:
         for name, address in accounts.items():
             try:
                 balances[name] = self.get_balance(address, block_hash, force_refetch=force_refetch)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to fetch balance for {name} ({address}): {e}")
                 balances[name] = Balance(free=0.0, reserved=0.0, frozen=0.0)
         return balances

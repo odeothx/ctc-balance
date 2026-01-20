@@ -1,11 +1,14 @@
-from typing import Dict, List, Optional, Tuple, Any
-from datetime import date
+import logging
+from typing import Dict, Optional, Tuple
 from substrateinterface import SubstrateInterface
 from src.chain import NODE_URL
 from src.utils import retry
 
 CTC_DECIMALS = 18
 CTC_DIVISOR = 10**CTC_DECIMALS
+
+logger = logging.getLogger(__name__)
+
 
 class StakingReward:
     """Staking reward data."""
@@ -19,12 +22,29 @@ class StakingReward:
     def to_dict(self):
         return {"claimed": self.claimed}
 
+
 class RewardTracker:
     """Reward tracker for Creditcoin3 accounts."""
 
-    def __init__(self, url: str = NODE_URL, substrate=None):
+    def __init__(self, url: str = NODE_URL, substrate: SubstrateInterface | None = None):
         self.url = url
         self._substrate = substrate
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self):
+        """Close the substrate connection."""
+        if self._substrate is not None:
+            try:
+                self._substrate.close()
+            except Exception:
+                pass
+            self._substrate = None
 
     @property
     def substrate(self) -> SubstrateInterface:
@@ -33,6 +53,7 @@ class RewardTracker:
             self._substrate = SubstrateInterface(url=self.url)
         return self._substrate
 
+    @retry(max_retries=3)
     def get_active_era(self, block_hash: str) -> Optional[int]:
         """Get active era at a specific block hash."""
         result = self.substrate.query(
@@ -70,6 +91,7 @@ class RewardTracker:
 
         return {name: StakingReward(claimed=amt / CTC_DIVISOR) for name, amt in results.items()}
 
+    @retry(max_retries=3)
     def _process_era_rewards(self, era: int, block_hash: str, address_to_name: Dict[str, str], results: Dict[str, float]):
         """Process a single era's rewards."""
         # 1. Get total era reward
@@ -177,6 +199,7 @@ class RewardTracker:
                 n_reward = r_v_total * (1.0 - commission_ratio) * (n_value / e_total)
                 results[name] += n_reward
 
+    @retry(max_retries=3)
     def _fetch_validator_exposure(self, era: int, v_address: str, block_hash: str) -> Tuple[Optional[Dict], bool]:
         """Fetch validator exposure (Overview/Paged or Clipped)."""
         # Try ErasStakersOverview (Paged Staking)

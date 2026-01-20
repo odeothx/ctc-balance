@@ -14,7 +14,7 @@ Usage:
 import argparse
 import csv
 import json
-import os
+import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -30,19 +30,26 @@ from src.balance import BalanceTracker
 from src.reward import RewardTracker
 
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Creditcoin3 메인넷 시작일 (Genesis: 2024-08-28)
 GENESIS_DATE = date(2024, 8, 29)  # 블록 1부터 시작
 OUTPUT_DIR = Path(__file__).parent / "output"
 CACHE_FILE = OUTPUT_DIR / "block_cache.json"
 REWARD_CACHE_FILE = OUTPUT_DIR / "reward_cache.json"
 
+# Block constants
+BLOCK_TIME_SECONDS = 15
+BLOCKS_PER_DAY = 24 * 60 * 60 // BLOCK_TIME_SECONDS  # 5760 blocks
+
 # Concurrency Constants (Matched with Rust version)
 CONCURRENCY_DATES = 5
 CONCURRENCY_BALANCES = 3
-CONCURRENCY_REWARDS = 2
-CONCURRENCY_STORAGE = 10
-CONCURRENCY_EVENTS = 50
-CONCURRENCY_EXPOSURES = 20
 
 
 def format_ctc(amount: float) -> str:
@@ -113,10 +120,10 @@ def _find_block_worker(d: date) -> tuple[date, int, str]:
                 # Reconnect and retry
                 try:
                     worker_chain.reconnect()
-                except:
+                except Exception:
                     pass
             else:
-                print(f"Error in _find_block_worker for {d}: {e}")
+                logger.error(f"Error in _find_block_worker for {d}: {e}")
                 raise
 
 
@@ -455,7 +462,7 @@ def main():
                 start_block = block_info["block"]
                 start_hash = block_info["hash"]
                 
-                # Next day's block or +5760 (1 day of blocks)
+                # Next day's block or +BLOCKS_PER_DAY (1 day of blocks)
                 if idx + 1 < len(dates):
                     next_date_str = dates[idx+1].isoformat()
                     next_block_info = block_map.get(next_date_str)
@@ -463,10 +470,10 @@ def main():
                         end_block = next_block_info["block"]
                         end_hash = next_block_info["hash"]
                     else:
-                        end_block = start_block + 5760
+                        end_block = start_block + BLOCKS_PER_DAY
                         end_hash = chain.get_block_hash(end_block)
                 else:
-                    end_block = start_block + 5760
+                    end_block = start_block + BLOCKS_PER_DAY
                     end_hash = chain.get_block_hash(end_block)
                 
                 try:

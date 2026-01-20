@@ -2,13 +2,17 @@
 Chain connection and block query module for Creditcoin3.
 """
 
+import logging
 from substrateinterface import SubstrateInterface
 from datetime import datetime, timezone
+from src.utils import retry
 
 
 # Creditcoin3 메인넷 설정
 NODE_URL = "wss://mainnet3.creditcoin.network"
 BLOCK_TIME_SECONDS = 15
+
+logger = logging.getLogger(__name__)
 
 
 class ChainConnector:
@@ -18,6 +22,13 @@ class ChainConnector:
         self.url = url
         self._substrate = None
         self._genesis_timestamp = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     @property
     def substrate(self) -> SubstrateInterface:
@@ -44,6 +55,7 @@ class ChainConnector:
                 pass
             self._substrate = None
 
+    @retry(max_retries=3)
     def get_chain_info(self) -> dict:
         """Get basic chain information."""
         return {
@@ -52,15 +64,18 @@ class ChainConnector:
             "genesis_hash": str(self.substrate.get_block_hash(0)),
         }
 
+    @retry(max_retries=3)
     def get_block_hash(self, block_number: int) -> str:
         """Get block hash by block number."""
         return self.substrate.get_block_hash(block_number)
 
+    @retry(max_retries=3)
     def get_latest_block_number(self) -> int:
         """Get the latest finalized block number."""
         header = self.substrate.get_block_header(finalized_only=True)
         return header["header"]["number"]
 
+    @retry(max_retries=3)
     def get_block_timestamp(self, block_hash: str) -> int:
         """Get block timestamp in seconds (Unix timestamp)."""
         result = self.substrate.query(
