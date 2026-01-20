@@ -3,6 +3,7 @@ Account loader module - loads wallet addresses from text files.
 """
 
 from pathlib import Path
+from src.utils import validate_ss58_address
 
 
 def load_accounts(file_path: str | Path) -> dict[str, str]:
@@ -18,6 +19,9 @@ def load_accounts(file_path: str | Path) -> dict[str, str]:
         
     Returns:
         Dict of {name: address}
+        
+    Raises:
+        ValueError: If an invalid SS58 address is found
     """
     accounts = {}
     path = Path(file_path)
@@ -26,7 +30,7 @@ def load_accounts(file_path: str | Path) -> dict[str, str]:
         raise FileNotFoundError(f"Accounts file not found: {path}")
     
     with open(path, "r") as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             line = line.strip()
             # Skip empty lines and comments
             if not line or line.startswith("#"):
@@ -35,14 +39,22 @@ def load_accounts(file_path: str | Path) -> dict[str, str]:
             # Parse "name = address" or "name address" format
             if "=" in line:
                 name, address = line.split("=", 1)
-                accounts[name.strip()] = address.strip()
+                name = name.strip()
+                address = address.strip()
             else:
                 # Space-separated format: "name address"
                 parts = line.split()
                 if len(parts) >= 2:
                     name = parts[0]
                     address = parts[1]
-                    accounts[name] = address
+                else:
+                    continue
+            
+            # Validate SS58 address (Major Fix: validate input)
+            if not validate_ss58_address(address):
+                raise ValueError(f"Invalid SS58 address at line {line_num}: {name} = {address}")
+            
+            accounts[name] = address
     
     return accounts
 

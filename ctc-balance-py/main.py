@@ -30,6 +30,7 @@ from src.chain import ChainConnector
 from src.balance import BalanceTracker
 from src.reward import RewardTracker
 from src import BLOCKS_PER_DAY
+from src.utils import get_utc_midnight_timestamp
 
 
 # Configure logging
@@ -90,13 +91,29 @@ def save_reward_cache(cache: dict):
             json.dump(cache, f)
 
 
-def get_utc_midnight_timestamp(d: date) -> int:
-    """Get Unix timestamp for UTC midnight of a date."""
-    dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
-    return int(dt.timestamp())
+
+# Thread-local storage for worker connections (Critical Fix: Thread Safety)
+import threading
+import atexit
+
+_thread_local = threading.local()
+_active_connections: list = []
+_connections_lock = threading.Lock()
+
+def _cleanup_connections():
+    """Cleanup all active connections on exit."""
+    with _connections_lock:
+        for conn in _active_connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _active_connections.clear()
+
+atexit.register(_cleanup_connections)
 
 
-# Global variable for worker process
+# Global variable for worker process (ProcessPoolExecutor uses separate processes)
 worker_chain: ChainConnector | None = None
 
 
@@ -104,6 +121,8 @@ def init_worker():
     """Initialize worker process with a shared connection."""
     global worker_chain
     worker_chain = ChainConnector()
+    with _connections_lock:
+        _active_connections.append(worker_chain)
 
 
 def _find_block_worker(d: date) -> tuple[date, int, str]:
@@ -203,7 +222,6 @@ def parse_args():
     parser.add_argument("--no-cache", action="store_true", help="Ignore block cache")
     parser.add_argument("--no-rewards", action="store_true", help="Skip fetching staking rewards")
     parser.add_argument("--refetch-zero", action="store_true", help="Re-fetch if balance is zero")
-    parser.add_argument("--local-rpc", help="Local RPC URL for faster access to recent blocks")
     
     return parser.parse_args()
 

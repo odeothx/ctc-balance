@@ -64,6 +64,7 @@ class RewardTracker:
             return result.value.get("index")
         return None
 
+    @retry(max_retries=3)
     def get_rewards_via_eras(
         self, 
         accounts: Dict[str, str], 

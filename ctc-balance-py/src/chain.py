@@ -11,6 +11,7 @@ from src.utils import retry
 # Creditcoin3 메인넷 설정
 NODE_URL = "wss://mainnet3.creditcoin.network"
 BLOCK_TIME_SECONDS = 15
+BLOCK_SEARCH_WINDOW = 20000  # ~3.5 days at 15s block time
 
 logger = logging.getLogger(__name__)
 
@@ -110,12 +111,9 @@ class ChainConnector:
             genesis_ts = self.get_genesis_timestamp()
             estimated_block = int((target_timestamp - genesis_ts) / BLOCK_TIME_SECONDS)
             
-            # Define search window (e.g. +/- 20,000 blocks ~= 3.5 days)
-            # This handles slight variations in block time or pauses
-            window = 20000 
-            
-            low = max(0, estimated_block - window)
-            high = min(latest_block, estimated_block + window)
+            # Use named constant for search window
+            low = max(0, estimated_block - BLOCK_SEARCH_WINDOW)
+            high = min(latest_block, estimated_block + BLOCK_SEARCH_WINDOW)
             
             # Verify if target is likely within this range
             # If we are way off, we might want to expand, but let's trust estimation first

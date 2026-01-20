@@ -4,11 +4,14 @@ Utility functions for CTC Balance Tracker.
 
 import csv
 import json
+import logging
 from pathlib import Path
 from datetime import datetime, date, timezone
 from typing import Any, Callable, TypeVar, cast
 import functools
 import time
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -138,7 +141,7 @@ def retry(
                 except exceptions as e:
                     last_exception = e
                     delay = base_delay * (2**i)
-                    # print(f"  Retry {i+1}/{max_retries} for {func.__name__} after {delay}s due to: {e}")
+                    logger.debug(f"Retry {i+1}/{max_retries} for {func.__name__} after {delay}s due to: {e}")
                     time.sleep(delay)
             raise cast(Exception, last_exception)
 
