@@ -27,12 +27,14 @@ import matplotlib.dates as mdates
 from accounts import load_accounts
 from src.chain import ChainConnector
 from src.balance import BalanceTracker
+from src.reward import RewardTracker
 
 
 # Creditcoin3 메인넷 시작일 (Genesis: 2024-08-28)
 GENESIS_DATE = date(2024, 8, 29)  # 블록 1부터 시작
 OUTPUT_DIR = Path(__file__).parent / "output"
 CACHE_FILE = OUTPUT_DIR / "block_cache.json"
+REWARD_CACHE_FILE = OUTPUT_DIR / "reward_cache.json"
 
 
 def format_ctc(amount: float) -> str:
@@ -52,6 +54,21 @@ def save_block_cache(cache: dict):
     """Save date->block mappings to cache."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
+
+def load_reward_cache() -> dict:
+    """Load cached rewards."""
+    if REWARD_CACHE_FILE.exists():
+        with open(REWARD_CACHE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_reward_cache(cache: dict):
+    """Save rewards to cache."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(REWARD_CACHE_FILE, "w") as f:
         json.dump(cache, f)
 
 
@@ -130,6 +147,7 @@ def parse_args():
     parser.add_argument("-o", "--output", help="Output CSV file")
     parser.add_argument("--graph", "-g", action="store_true", help="Generate graph")
     parser.add_argument("--no-cache", action="store_true", help="Ignore block cache")
+    parser.add_argument("--no-rewards", action="store_true", help="Skip fetching staking rewards")
     
     return parser.parse_args()
 
@@ -173,7 +191,7 @@ def find_blocks_for_dates(chain: ChainConnector, dates: list[date], cache: dict)
     return results
 
 
-def plot_balances(dates: list[str], all_history: dict, account_names: list[str], 
+def plot_balances(dates: list[str], all_history: dict, reward_history: dict, account_names: list[str], 
                   output_file: Path, source_name: str):
     """Generate and save balance graphs (combined and individual)."""
     date_objects = [datetime.strptime(d, "%Y-%m-%d") for d in dates]
@@ -181,10 +199,11 @@ def plot_balances(dates: list[str], all_history: dict, account_names: list[str],
     graph_files = []
     
     # === 메인 그래프 (전체 계정 + 총합) ===
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
-    fig.suptitle(f"CTC Balance History - {source_name}", fontsize=14, fontweight='bold')
+    # Add a third subplot for rewards
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 15))
+    fig.suptitle(f"CTC Balance & Rewards History - {source_name}", fontsize=14, fontweight='bold')
     
-    # 상단: 개별 계정
+    # 1. Individual Account Balances
     for i, name in enumerate(account_names):
         balances = [all_history.get(name, {}).get(d, 0.0) for d in dates]
         ax1.plot(date_objects, balances, label=name, color=colors[i % len(colors)], linewidth=1.5)
@@ -194,26 +213,37 @@ def plot_balances(dates: list[str], all_history: dict, account_names: list[str],
     ax1.legend(loc='upper left', fontsize=9, ncol=2)
     ax1.grid(True, alpha=0.3)
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    ax1.xaxis.set_major_locator(mdates.MonthLocator())
+    ax1.xaxis.set_major_locator(mdates.MonthLocator() if len(dates) > 60 else mdates.DayLocator(interval=max(1, len(dates)//10)))
     plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
     
-    # 하단: 총 잔고
+    # 2. Total Balance Over Time
     totals = [sum(all_history.get(n, {}).get(d, 0.0) for n in account_names) for d in dates]
     ax2.fill_between(date_objects, totals, alpha=0.3, color='blue')
     ax2.plot(date_objects, totals, color='blue', linewidth=2)
-    ax2.set_xlabel("Date")
     ax2.set_ylabel("Total Balance (CTC)")
     ax2.set_title("Total Balance Over Time")
     ax2.grid(True, alpha=0.3)
     ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    ax2.xaxis.set_major_locator(mdates.MonthLocator())
+    ax2.xaxis.set_major_locator(mdates.MonthLocator() if len(dates) > 60 else mdates.DayLocator(interval=max(1, len(dates)//10)))
     plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
     ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
     
     if totals:
         ax2.annotate(f'{totals[0]:,.0f}', xy=(date_objects[0], totals[0]), fontsize=9)
         ax2.annotate(f'{totals[-1]:,.0f}', xy=(date_objects[-1], totals[-1]), fontsize=9, ha='right')
+
+    # 3. Daily Staking Rewards
+    reward_totals = [sum(reward_history.get(n, {}).get(d, 0.0) for n in account_names) for d in dates]
+    # Use bar chart for rewards
+    ax3.bar(date_objects, reward_totals, color='orange', alpha=0.7, width=0.8)
+    ax3.set_xlabel("Date")
+    ax3.set_ylabel("Daily Rewards (CTC)")
+    ax3.set_title("Daily Staking Rewards")
+    ax3.grid(True, linestyle='--', alpha=0.3)
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    ax3.xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
     
     plt.tight_layout()
     graph_file = output_file.with_suffix('.png')
@@ -227,26 +257,30 @@ def plot_balances(dates: list[str], all_history: dict, account_names: list[str],
     
     for i, name in enumerate(account_names):
         balances = [all_history.get(name, {}).get(d, 0.0) for d in dates]
+        rewards = [reward_history.get(name, {}).get(d, 0.0) for d in dates]
         
-        fig, ax = plt.subplots(figsize=(12, 6))
-        fig.suptitle(f"CTC Balance History - {name}", fontsize=14, fontweight='bold')
+        fig, (iax1, iax2) = plt.subplots(2, 1, figsize=(12, 10))
+        fig.suptitle(f"CTC Balance & Rewards - {name}", fontsize=14, fontweight='bold')
         
         color = colors[i % len(colors)]
-        ax.fill_between(date_objects, balances, alpha=0.3, color=color)
-        ax.plot(date_objects, balances, color=color, linewidth=2)
+        iax1.fill_between(date_objects, balances, alpha=0.3, color=color)
+        iax1.plot(date_objects, balances, color=color, linewidth=2)
+        iax1.set_ylabel("Balance (CTC)")
+        iax1.set_title("Balance History")
+        iax1.grid(True, alpha=0.3)
+        iax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        iax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.setp(iax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        iax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
         
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Balance (CTC)")
-        ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        ax.xaxis.set_major_locator(mdates.MonthLocator())
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
-        
-        # 시작/끝 잔고 표시
-        if balances:
-            ax.annotate(f'{balances[0]:,.0f}', xy=(date_objects[0], balances[0]), fontsize=9)
-            ax.annotate(f'{balances[-1]:,.0f}', xy=(date_objects[-1], balances[-1]), fontsize=9, ha='right')
+        iax2.bar(date_objects, rewards, color='orange', alpha=0.7, width=0.8)
+        iax2.set_xlabel("Date")
+        iax2.set_ylabel("Daily Reward (CTC)")
+        iax2.set_title("Daily Staking Rewards")
+        iax2.grid(True, linestyle='--', alpha=0.3)
+        iax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        iax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.setp(iax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
         
         plt.tight_layout()
         individual_file = individual_dir / f"{name}.png"
@@ -378,6 +412,72 @@ def main():
                 total = sum(balances.values())
                 print(f"  [{completed}/{total_tasks}] {key} completed")
 
+    # 4.5. Staking Rewards 조회
+    reward_history = {name: {} for name in accounts}
+    if not args.no_rewards:
+        print("\n[4.5/5] Fetching staking rewards...")
+        reward_cache = {} if args.no_cache else load_reward_cache()
+        
+        reward_tracker = RewardTracker()
+        
+        # Determine uncached dates
+        uncached_dates = []
+        for i, d in enumerate(dates):
+            date_str = d.isoformat()
+            
+            all_present = True
+            for name in accounts:
+                # Check if present in cache (allow 0.0)
+                if name not in reward_cache or date_str not in reward_cache[name]:
+                    all_present = False
+                    break
+            
+            if not all_present:
+                uncached_dates.append((i, date_str))
+        
+        if uncached_dates:
+            print(f"  Fetching rewards for {len(uncached_dates)} uncached dates...")
+            for idx, date_str in uncached_dates:
+                block_info = block_map.get(date_str)
+                if not block_info:
+                    continue
+                
+                # Get block range for this date
+                start_block = block_info["block"]
+                start_hash = block_info["hash"]
+                
+                # Next day's block or +5760 (1 day of blocks)
+                if idx + 1 < len(dates):
+                    next_date_str = dates[idx+1].isoformat()
+                    next_block_info = block_map.get(next_date_str)
+                    if next_block_info:
+                        end_block = next_block_info["block"]
+                        end_hash = next_block_info["hash"]
+                    else:
+                        end_block = start_block + 5760
+                        end_hash = chain.get_block_hash(end_block)
+                else:
+                    end_block = start_block + 5760
+                    end_hash = chain.get_block_hash(end_block)
+                
+                try:
+                    # Fetch rewards for this era/block range
+                    rewards = reward_tracker.get_rewards_via_eras(accounts, start_hash, end_hash)
+                    
+                    for name, reward in rewards.items():
+                        if name not in reward_cache:
+                            reward_cache[name] = {}
+                        reward_cache[name][date_str] = round(reward.claimed, 2)
+                        
+                    print(f"    {date_str} rewards fetched")
+                    save_reward_cache(reward_cache)
+                except Exception as e:
+                    print(f"    Warning: Failed to fetch rewards for {date_str}: {e}")
+        else:
+            print("  All rewards found in cache!")
+            
+        reward_history = reward_cache
+
     # 5. 결과 저장
     print(f"\n[5/5] Saving results...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -394,11 +494,10 @@ def main():
                 existing_data[date_key] = {}
             existing_data[date_key][name] = balance
 
-    header = ["date"] + account_names + ["total", "diff", "diff_avg10"]
+    header = ["date"] + account_names + ["total", "reward_total", "diff", "diff_avg10"]
     
     rows = []
-    diffs = []  # diff 값들을 저장
-    # Sort by date
+    diffs = []
     all_date_keys = sorted(existing_data.keys())
     
     prev_total = None
@@ -413,7 +512,13 @@ def main():
         total = round(total, 1)
         row.append(total)
         
-        # 이전 잔고와의 차이 계산
+        # Calculate daily total reward
+        day_reward = 0.0
+        for name in account_names:
+            day_reward += reward_history.get(name, {}).get(key, 0.0)
+        row.append(round(day_reward, 1))
+        
+        # 차이 계산
         if prev_total is not None:
             diff = round(total - prev_total, 1)
         else:
@@ -450,6 +555,7 @@ def main():
         
         for key in all_date_keys:
             bal = existing_data[key].get(name, 0.0)
+            reward = reward_history.get(name, {}).get(key, 0.0)
             
             # 차이 계산
             if prev_bal is not None:
@@ -465,12 +571,12 @@ def main():
             else:
                 d_avg10 = round(sum(indiv_diffs) / len(indiv_diffs), 1) if indiv_diffs else 0.0
                 
-            indiv_rows.append([key, bal, d, d_avg10])
+            indiv_rows.append([key, bal, reward, d, d_avg10])
             prev_bal = bal
             
         with open(indiv_csv, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["date", "balance", "diff", "diff_avg10"])
+            writer.writerow(["date", "balance", "reward", "diff", "diff_avg10"])
             writer.writerows(indiv_rows)
             
     print(f"  CSV (Individual): {len(account_names)} files in {individual_dir}")
@@ -485,7 +591,7 @@ def main():
                 if acc_name in row_data:
                     full_history[acc_name][d_key] = row_data[acc_name]
                     
-        graph_files = plot_balances(all_date_keys, full_history, account_names, output_file, source_name)
+        graph_files = plot_balances(all_date_keys, full_history, reward_history, account_names, output_file, source_name)
         print(f"  Main graph: {graph_files[0]}")
         print(f"  Individual graphs: {len(graph_files) - 1} files in {output_file.parent / 'individual'}")
     

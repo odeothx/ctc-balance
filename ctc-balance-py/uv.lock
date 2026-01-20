@@ -215,14 +215,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
-    { name = "requests" },
     { name = "substrate-interface" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.8.0" },
-    { name = "requests", specifier = ">=2.31.0" },
     { name = "substrate-interface", specifier = ">=1.7.11" },
 ]
 
