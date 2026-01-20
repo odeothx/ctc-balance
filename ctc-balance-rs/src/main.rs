@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
     };
 
     let local_rpc_url = args.local_rpc.clone();
+    let latest_block = chain.get_latest_block_number().await.unwrap_or(0);
 
     // 3. Find blocks for dates
     println!("\n[3/6] Finding blocks for dates...");
@@ -334,7 +335,10 @@ async fn main() -> Result<()> {
             .collect();
         let mut missing_date_block_ranges = Vec::new();
 
+        let today_str = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+
         for (i, date_str) in date_strings.iter().enumerate() {
+            let is_today = date_str == &today_str;
             let mut all_present = true;
             for name in accounts.keys() {
                 let present = reward_cache
@@ -347,14 +351,26 @@ async fn main() -> Result<()> {
                     break;
                 }
             }
-            if !all_present {
+
+            // Always fetch today, or if data is missing from cache
+            if !all_present || is_today {
                 if let Some(start_info) = cache.get(date_str) {
-                    let end_block = date_strings
+                    let next_block = date_strings
                         .get(i + 1)
                         .and_then(|next_date| cache.get(next_date))
                         .map(|b| b.block)
                         .unwrap_or(start_info.block + 5760);
-                    missing_date_block_ranges.push((date_str.clone(), start_info.block, end_block));
+
+                    // Cap end_block to current latest block
+                    let end_block = std::cmp::min(next_block, latest_block);
+
+                    if end_block >= start_info.block {
+                        missing_date_block_ranges.push((
+                            date_str.clone(),
+                            start_info.block,
+                            end_block,
+                        ));
+                    }
                 }
             }
         }
@@ -405,10 +421,19 @@ async fn main() -> Result<()> {
             while let Some((date_str, rewards_opt)) = stream.next().await {
                 if let Some(rewards) = rewards_opt {
                     for (name, reward) in rewards {
-                        reward_cache
-                            .entry(name)
-                            .or_insert_with(HashMap::new)
-                            .insert(date_str.clone(), reward.claimed);
+                        // Only cache past days. Today is always re-fetched to stay fresh.
+                        if date_str != today_str {
+                            reward_cache
+                                .entry(name)
+                                .or_insert_with(HashMap::new)
+                                .insert(date_str.clone(), reward.claimed);
+                        } else {
+                            // Still need it in current memory to show in output
+                            full_reward_history
+                                .entry(name)
+                                .or_insert_with(HashMap::new)
+                                .insert(date_str.clone(), reward.claimed);
+                        }
                     }
                 }
                 count += 1;
