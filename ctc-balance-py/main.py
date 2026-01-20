@@ -318,7 +318,7 @@ def main():
     print("=" * 60)
 
     # 1. 계정 로드
-    print("\n[1/5] Loading accounts...")
+    print("\n[1/6] Loading accounts...")
     if args.file:
         file_path = Path(args.file)
         if not file_path.exists():
@@ -332,7 +332,7 @@ def main():
         print(f"  Single wallet: {args.name}")
 
     # 2. 체인 연결
-    print("\n[2/5] Connecting to RPC...")
+    print("\n[2/6] Connecting to RPC...")
     chain = ChainConnector()
     tracker = BalanceTracker(chain)
     
@@ -344,7 +344,7 @@ def main():
         return 1
 
     # 3. 날짜 범위 및 블록 캐시
-    print("\n[3/5] Finding blocks for dates...")
+    print("\n[3/6] Finding blocks for dates...")
     start_date = args.start
     end_date = args.end
     
@@ -360,7 +360,7 @@ def main():
     block_map = find_blocks_for_dates(chain, dates, cache)
 
     # 4. 잔고 조회 (병렬 처리)
-    print(f"\n[4/5] Fetching balances (Parallel)...")
+    print(f"\n[4/6] Fetching balances (Parallel)...")
     all_history = {name: {} for name in accounts}
     
     output_file = Path(args.output) if args.output else OUTPUT_DIR / f"{source_name}_history.csv"
@@ -434,7 +434,7 @@ def main():
     # 4.5. Staking Rewards 조회
     reward_history = {name: {} for name in accounts}
     if not args.no_rewards:
-        print("\n[4.5/5] Fetching staking rewards...")
+        print("\n[5/6] Fetching staking rewards...")
         reward_cache = {} if args.no_cache else load_reward_cache()
         
         reward_tracker = RewardTracker()
@@ -504,8 +504,8 @@ def main():
             
         reward_history = reward_cache
 
-    # 5. 결과 저장
-    print(f"\n[5/5] Saving results...")
+    # 6. 결과 저장
+    print(f"\n[6/6] Saving results...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     account_names = sorted(accounts.keys())
@@ -518,10 +518,17 @@ def main():
                 existing_data[date_key] = {}
             existing_data[date_key][name] = balance
 
-    header = ["date"] + account_names + ["total", "reward_total", "diff", "diff_avg10"]
+    # Build header: date, accounts..., total, diff, diff_avg10, account_rewards..., total_reward, reward_avg10, total_reward_cumulative
+    header = ["date"] + account_names + ["total", "diff", "diff_avg10"]
+    # Add individual reward columns
+    for name in account_names:
+        header.append(f"{name}_reward")
+    header.extend(["total_reward", "reward_avg10", "total_reward_cumulative"])
     
     rows = []
     diffs = []
+    reward_totals = []
+    total_reward_cumulative = 0.0
     all_date_keys = sorted(existing_data.keys())
     
     prev_total = None
@@ -535,12 +542,6 @@ def main():
             total += bal
         total = round(total, 1)
         row.append(total)
-        
-        # Calculate daily total reward
-        day_reward = 0.0
-        for name in account_names:
-            day_reward += reward_history.get(name, {}).get(key, 0.0)
-        row.append(round(day_reward, 1))
         
         # 차이 계산
         if prev_total is not None:
@@ -557,6 +558,28 @@ def main():
         else:
             diff_avg10 = round(sum(diffs) / len(diffs), 1) if diffs else 0.0
         row.append(diff_avg10)
+        
+        # Add individual account rewards
+        day_reward = 0.0
+        for name in account_names:
+            reward = reward_history.get(name, {}).get(key, 0.0)
+            row.append(round(reward, 4))
+            day_reward += reward
+        
+        # Total reward for this day
+        row.append(round(day_reward, 4))
+        reward_totals.append(day_reward)
+        
+        # 10-day average for rewards
+        if len(reward_totals) >= 10:
+            reward_avg10 = round(sum(reward_totals[-10:]) / 10, 4)
+        else:
+            reward_avg10 = round(sum(reward_totals) / len(reward_totals), 4) if reward_totals else 0.0
+        row.append(reward_avg10)
+        
+        # Cumulative total reward
+        total_reward_cumulative += day_reward
+        row.append(round(total_reward_cumulative, 4))
         
         rows.append(row)
     
@@ -575,6 +598,8 @@ def main():
         indiv_csv = individual_dir / f"{name}.csv"
         indiv_rows = []
         indiv_diffs = []
+        indiv_rewards = []
+        reward_cumulative = 0.0
         prev_bal = None
         
         for key in all_date_keys:
@@ -588,19 +613,30 @@ def main():
                 d = 0.0
             
             indiv_diffs.append(d)
+            indiv_rewards.append(reward)
             
-            # 10일 평균 계산
+            # 10일 평균 계산 (balance diff)
             if len(indiv_diffs) >= 10:
                 d_avg10 = round(sum(indiv_diffs[-10:]) / 10, 1)
             else:
                 d_avg10 = round(sum(indiv_diffs) / len(indiv_diffs), 1) if indiv_diffs else 0.0
+            
+            # 10일 평균 계산 (reward)
+            if len(indiv_rewards) >= 10:
+                reward_avg10 = round(sum(indiv_rewards[-10:]) / 10, 4)
+            else:
+                reward_avg10 = round(sum(indiv_rewards) / len(indiv_rewards), 4) if indiv_rewards else 0.0
+            
+            # Cumulative reward
+            reward_cumulative += reward
                 
-            indiv_rows.append([key, bal, reward, d, d_avg10])
+            # Rust format: date,balance,diff,diff_avg10,reward,reward_avg10,reward_cumulative
+            indiv_rows.append([key, bal, d, d_avg10, round(reward, 4), reward_avg10, round(reward_cumulative, 4)])
             prev_bal = bal
             
         with open(indiv_csv, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["date", "balance", "reward", "diff", "diff_avg10"])
+            writer.writerow(["date", "balance", "diff", "diff_avg10", "reward", "reward_avg10", "reward_cumulative"])
             writer.writerows(indiv_rows)
             
     print(f"  CSV (Individual): {len(account_names)} files in {individual_dir}")
