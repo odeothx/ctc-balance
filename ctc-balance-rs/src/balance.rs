@@ -128,37 +128,48 @@ impl BalanceTracker {
                 let mut reserved = 0u128;
                 let mut frozen = 0u128;
 
+                // System.Account structure: { nonce, consumers, providers, sufficients, data: { free, reserved, frozen, flags } }
                 if let subxt::ext::scale_value::ValueDef::Composite(
                     subxt::ext::scale_value::Composite::Named(fields),
                 ) = decoded.value
                 {
                     for (name, field) in fields {
-                        match name.as_str() {
-                            "free" => {
-                                if let subxt::ext::scale_value::ValueDef::Primitive(
-                                    subxt::ext::scale_value::Primitive::U128(val),
-                                ) = field.value
-                                {
-                                    free = val;
+                        if name.as_str() == "data" {
+                            // Extract balance data from the nested 'data' field
+                            if let subxt::ext::scale_value::ValueDef::Composite(
+                                subxt::ext::scale_value::Composite::Named(data_fields),
+                            ) = field.value
+                            {
+                                for (data_name, data_field) in data_fields {
+                                    match data_name.as_str() {
+                                        "free" => {
+                                            if let subxt::ext::scale_value::ValueDef::Primitive(
+                                                subxt::ext::scale_value::Primitive::U128(val),
+                                            ) = data_field.value
+                                            {
+                                                free = val;
+                                            }
+                                        }
+                                        "reserved" => {
+                                            if let subxt::ext::scale_value::ValueDef::Primitive(
+                                                subxt::ext::scale_value::Primitive::U128(val),
+                                            ) = data_field.value
+                                            {
+                                                reserved = val;
+                                            }
+                                        }
+                                        "frozen" => {
+                                            if let subxt::ext::scale_value::ValueDef::Primitive(
+                                                subxt::ext::scale_value::Primitive::U128(val),
+                                            ) = data_field.value
+                                            {
+                                                frozen = val;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
-                            "reserved" => {
-                                if let subxt::ext::scale_value::ValueDef::Primitive(
-                                    subxt::ext::scale_value::Primitive::U128(val),
-                                ) = field.value
-                                {
-                                    reserved = val;
-                                }
-                            }
-                            "frozen" => {
-                                if let subxt::ext::scale_value::ValueDef::Primitive(
-                                    subxt::ext::scale_value::Primitive::U128(val),
-                                ) = field.value
-                                {
-                                    frozen = val;
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }

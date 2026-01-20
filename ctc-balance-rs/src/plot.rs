@@ -266,7 +266,15 @@ pub fn plot_balances<P: AsRef<Path>>(
             .collect();
 
         let max_balance = balances.iter().cloned().fold(0.0f64, |a, b| a.max(b)) * 1.1;
-        if max_balance <= 0.0 {
+
+        // Check if this account has any reward data
+        let has_individual_rewards = individual_reward_history
+            .and_then(|h| h.get(name))
+            .map(|r| r.values().any(|&v| v > 0.0))
+            .unwrap_or(false);
+
+        // Skip only if no balance AND no rewards
+        if max_balance <= 0.0 && !has_individual_rewards {
             continue;
         }
 
