@@ -230,7 +230,7 @@ pub fn load_existing_csv<P: AsRef<Path>>(
                 if let Ok(value) = value_str.parse::<f64>() {
                     existing_data
                         .entry(header.clone())
-                        .or_insert_with(HashMap::new)
+                        .or_default()
                         .insert(date.clone(), value);
                 }
             }
@@ -241,7 +241,7 @@ pub fn load_existing_csv<P: AsRef<Path>>(
 }
 
 /// Calculate diff and diff_avg10 for entries
-pub fn calculate_diffs(entries: &mut Vec<HistoryEntry>) {
+pub fn calculate_diffs(entries: &mut [HistoryEntry]) {
     let mut diffs: Vec<f64> = Vec::new();
     let mut prev_total: Option<f64> = None;
 

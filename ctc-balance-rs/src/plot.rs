@@ -92,8 +92,8 @@ pub fn plot_balances<P: AsRef<Path>>(
 
         let panels = if has_rewards {
             // 3-panel layout: top (400), middle (400), bottom (500)
-            let (top_mid, bottom) = root.split_vertically((graph_height as u32 * 6) / 10);
-            let (upper, lower) = top_mid.split_vertically((graph_height as u32 * 3) / 10);
+            let (top_mid, bottom) = root.split_vertically((graph_height * 6) / 10);
+            let (upper, lower) = top_mid.split_vertically((graph_height * 3) / 10);
             (upper, lower, Some(bottom))
         } else {
             let (upper, lower) = root.split_vertically(500);
@@ -110,7 +110,7 @@ pub fn plot_balances<P: AsRef<Path>>(
         // Upper panel: Individual balances
         {
             let x_range = if date_objects.len() > 1 {
-                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone()
+                *date_objects.first().unwrap()..*date_objects.last().unwrap()
             } else {
                 let d = date_objects[0];
                 d.pred_opt().unwrap_or(d)..d.succ_opt().unwrap_or(d)
@@ -142,7 +142,7 @@ pub fn plot_balances<P: AsRef<Path>>(
                         all_history
                             .get(name)
                             .and_then(|h| h.get(date_str))
-                            .map(|&v| (date_obj.clone(), v))
+                            .map(|&v| (*date_obj, v))
                     })
                     .collect();
 
@@ -155,15 +155,15 @@ pub fn plot_balances<P: AsRef<Path>>(
             chart
                 .configure_series_labels()
                 .position(SeriesLabelPosition::UpperLeft)
-                .background_style(&WHITE.mix(0.8))
-                .border_style(&BLACK)
+                .background_style(WHITE.mix(0.8))
+                .border_style(BLACK)
                 .draw()?;
         }
 
         // Middle panel: Total balance
         {
             let x_range =
-                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone();
+                *date_objects.first().unwrap()..*date_objects.last().unwrap();
             let y_max = max_total * 1.1;
 
             let mut chart = ChartBuilder::on(&panels.1)
@@ -204,7 +204,7 @@ pub fn plot_balances<P: AsRef<Path>>(
             let max_reward = if max_reward <= 0.0 { 1.0 } else { max_reward };
 
             let x_range = if date_objects.len() > 1 {
-                date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone()
+                *date_objects.first().unwrap()..*date_objects.last().unwrap()
             } else {
                 let d = date_objects[0];
                 d.pred_opt().unwrap_or(d)..d.succ_opt().unwrap_or(d)
@@ -277,7 +277,7 @@ pub fn plot_balances<P: AsRef<Path>>(
         root.fill(&WHITE)?;
 
         let x_range = if date_objects.len() > 1 {
-            date_objects.first().unwrap().clone()..date_objects.last().unwrap().clone()
+            *date_objects.first().unwrap()..*date_objects.last().unwrap()
         } else {
             let d = date_objects[0];
             d.pred_opt().unwrap_or(d)..d.succ_opt().unwrap_or(d)
@@ -407,7 +407,7 @@ fn format_ctc(amount: f64) -> String {
     let mut result = String::new();
 
     for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i) % 3 == 0 {
+        if i > 0 && (chars.len() - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(*c);

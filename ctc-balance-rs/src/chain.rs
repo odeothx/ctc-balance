@@ -70,17 +70,27 @@ impl ChainConnector {
     }
 
     /// Get the online client
-    fn client(&self) -> Result<&Arc<OnlineClient<PolkadotConfig>>> {
+    pub fn client(&self) -> Result<&Arc<OnlineClient<PolkadotConfig>>> {
         self.client
             .as_ref()
             .context("Not connected. Call connect() first.")
     }
 
+    /// Set the online client (injection for connector reuse)
+    pub fn set_client(&mut self, client: Arc<OnlineClient<PolkadotConfig>>) {
+        self.client = Some(client);
+    }
+
     /// Get the RPC methods
-    fn rpc(&self) -> Result<&Arc<LegacyRpcMethods<PolkadotConfig>>> {
+    pub fn rpc(&self) -> Result<&Arc<LegacyRpcMethods<PolkadotConfig>>> {
         self.rpc
             .as_ref()
             .context("Not connected. Call connect() first.")
+    }
+
+    /// Set the RPC methods (injection for connector reuse)
+    pub fn set_rpc(&mut self, rpc: Arc<LegacyRpcMethods<PolkadotConfig>>) {
+        self.rpc = Some(rpc);
     }
 
     /// Get chain information
@@ -195,11 +205,7 @@ impl ChainConnector {
             let block_hash = self.get_block_hash(mid).await?;
             let block_time = self.get_block_timestamp(&block_hash).await?;
 
-            let diff = if block_time > target_timestamp {
-                block_time - target_timestamp
-            } else {
-                target_timestamp - block_time
-            };
+            let diff = block_time.abs_diff(target_timestamp);
 
             if diff < best_diff {
                 best_diff = diff;

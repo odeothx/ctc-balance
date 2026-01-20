@@ -8,7 +8,7 @@ use subxt::{
     OnlineClient, PolkadotConfig,
 };
 
-use crate::CTC_DECIMALS;
+use crate::CTC_DIVISOR;
 
 /// Account balance data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +58,11 @@ impl BalanceTracker {
             client: None,
             _rpc: None,
         }
+    }
+
+    /// Set the online client (injection for tracker reuse)
+    pub fn set_client(&mut self, client: OnlineClient<PolkadotConfig>) {
+        self.client = Some(client);
     }
 
     /// Connect to the node
@@ -118,21 +123,50 @@ impl BalanceTracker {
 
         match storage_value {
             Some(value) => {
-                // Convert to Value for parsing
                 let decoded = value.to_value()?;
-                let divisor = 10u128.pow(CTC_DECIMALS) as f64;
+                let mut free = 0u128;
+                let mut reserved = 0u128;
+                let mut frozen = 0u128;
 
-                // Use debug representation to extract values
-                let debug_str = format!("{:?}", decoded);
-
-                let free = parse_field_value(&debug_str, "free").unwrap_or(0);
-                let reserved = parse_field_value(&debug_str, "reserved").unwrap_or(0);
-                let frozen = parse_field_value(&debug_str, "frozen").unwrap_or(0);
+                if let subxt::ext::scale_value::ValueDef::Composite(
+                    subxt::ext::scale_value::Composite::Named(fields),
+                ) = decoded.value
+                {
+                    for (name, field) in fields {
+                        match name.as_str() {
+                            "free" => {
+                                if let subxt::ext::scale_value::ValueDef::Primitive(
+                                    subxt::ext::scale_value::Primitive::U128(val),
+                                ) = field.value
+                                {
+                                    free = val;
+                                }
+                            }
+                            "reserved" => {
+                                if let subxt::ext::scale_value::ValueDef::Primitive(
+                                    subxt::ext::scale_value::Primitive::U128(val),
+                                ) = field.value
+                                {
+                                    reserved = val;
+                                }
+                            }
+                            "frozen" => {
+                                if let subxt::ext::scale_value::ValueDef::Primitive(
+                                    subxt::ext::scale_value::Primitive::U128(val),
+                                ) = field.value
+                                {
+                                    frozen = val;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
                 Ok(Balance {
-                    free: free as f64 / divisor,
-                    reserved: reserved as f64 / divisor,
-                    frozen: frozen as f64 / divisor,
+                    free: free as f64 / CTC_DIVISOR,
+                    reserved: reserved as f64 / CTC_DIVISOR,
+                    frozen: frozen as f64 / CTC_DIVISOR,
                 })
             }
             None => Ok(Balance::zero()),
@@ -150,63 +184,35 @@ impl BalanceTracker {
         let client = self.client.clone().context("Client not initialized")?;
         let block_hash_str = block_hash.to_string();
 
-        let mut tasks = Vec::new();
-        for (name, address) in accounts {
-            let name = name.clone();
-            let address = address.clone();
-            let mut tracker = BalanceTracker {
-                url: self.url.clone(),
-                client: Some(client.clone()),
-                _rpc: None,
-            };
-            let block_hash_task = block_hash_str.clone();
+        use futures::stream::{self, StreamExt};
+        let mut stream = stream::iter(accounts.iter())
+            .map(|(name, address)| {
+                let name = name.clone();
+                let address = address.clone();
+                let client = client.clone();
+                let block_hash = block_hash_str.clone();
+                let url = self.url.clone();
 
-            tasks.push(tokio::spawn(async move {
-                let res = tracker.get_balance(&address, &block_hash_task).await;
-                (name, res)
-            }));
-        }
+                async move {
+                    let mut tracker = BalanceTracker {
+                        url,
+                        client: Some(client),
+                        _rpc: None,
+                    };
+                    let res = tracker.get_balance(&address, &block_hash).await;
+                    (name, res)
+                }
+            })
+            .buffer_unordered(crate::CONCURRENCY_STORAGE);
 
-        let results = futures::future::join_all(tasks).await;
         let mut balances = HashMap::new();
-        for res in results {
-            let (name, balance_res) = res.context("Join error in get_all_balances")?;
-            let balance = balance_res?;
+        while let Some((name, res)) = stream.next().await {
+            let balance = res?;
             balances.insert(name, balance);
         }
 
         Ok(balances)
     }
-}
-
-/// Parse a field value from debug string
-///
-/// Looks for patterns like:
-/// - `("free", Value { value: Primitive(U128(12345))`
-fn parse_field_value(debug_str: &str, field_name: &str) -> Option<u128> {
-    // Pattern for the actual format: ("field", Value { value: Primitive(U128(number))
-    let pattern1 = format!("(\"{}\", Value", field_name);
-    let pattern2 = format!("\"{}\", Value", field_name);
-
-    for pattern in [&pattern1, &pattern2] {
-        if let Some(pos) = debug_str.find(pattern.as_str()) {
-            // Find U128( after this position
-            let remaining = &debug_str[pos..];
-            if let Some(u128_pos) = remaining.find("U128(") {
-                let after_u128 = &remaining[(u128_pos + 5)..];
-                // Extract the number until the closing paren
-                let num_str: String = after_u128
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if !num_str.is_empty() {
-                    return num_str.parse().ok();
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Parse SS58 address to AccountId32
@@ -215,22 +221,6 @@ fn parse_field_value(debug_str: &str, field_name: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_field_value() {
-        let debug_str = r#"Composite(Named([("free", Value { value: Primitive(U128(1000000000000000000)) }), ("reserved", Value { value: Primitive(U128(500000000000000000)) }), ("frozen", Value { value: Primitive(U128(0)) })]))"#;
-
-        assert_eq!(
-            parse_field_value(debug_str, "free"),
-            Some(1000000000000000000)
-        );
-        assert_eq!(
-            parse_field_value(debug_str, "reserved"),
-            Some(500000000000000000)
-        );
-        assert_eq!(parse_field_value(debug_str, "frozen"), Some(0));
-        assert_eq!(parse_field_value(debug_str, "nonexistent"), None);
-    }
 
     #[test]
     fn test_parse_ss58_address() {

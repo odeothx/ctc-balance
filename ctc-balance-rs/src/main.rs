@@ -21,7 +21,7 @@ use ctc_balance::{
     },
     plot::plot_balances,
     reward::RewardTracker,
-    GENESIS_DATE, NODE_URL,
+    CONCURRENCY_BALANCES, CONCURRENCY_DATES, CONCURRENCY_REWARDS, GENESIS_DATE, NODE_URL,
 };
 
 /// CTC Balance Tracker - Track Creditcoin3 wallet balances
@@ -186,17 +186,24 @@ async fn main() -> Result<()> {
             dates_to_find.len()
         );
         use futures::stream::{self, StreamExt};
+        let client = chain.client().ok().cloned();
+
         let mut stream = stream::iter(dates_to_find.iter())
             .map(|&d| {
-                let mut chain = ChainConnector::new(Some(NODE_URL));
+                let client = client.clone();
                 let date_str = d.format("%Y-%m-%d").to_string();
                 let timestamp = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as u64;
                 async move {
-                    let res = chain.find_block_at_timestamp(timestamp, 60).await;
+                    // Create a temporary connector that reuses the client
+                    let mut temp_chain = ChainConnector::new(Some(NODE_URL));
+                    if let Some(c) = client {
+                        temp_chain.set_client(c);
+                    }
+                    let res = temp_chain.find_block_at_timestamp(timestamp, 60).await;
                     (date_str, res)
                 }
             })
-            .buffer_unordered(5);
+            .buffer_unordered(CONCURRENCY_DATES);
 
         let mut count = 0;
         while let Some((date_str, res)) = stream.next().await {
@@ -262,14 +269,19 @@ async fn main() -> Result<()> {
     if !dates_to_fetch.is_empty() {
         println!("  Fetching {} new dates...", dates_to_fetch.len());
         use futures::stream::{self, StreamExt};
+        let client = chain.client().ok().cloned();
         let mut stream = stream::iter(dates_to_fetch.iter())
             .map(|date_str| {
-                let mut tracker = BalanceTracker::new(NODE_URL);
+                let client = client.clone();
                 let date_str = date_str.clone();
                 let accounts = accounts.clone();
                 let block_info = cache.get(&date_str).cloned();
                 async move {
                     if let Some(block_info) = block_info {
+                        let mut tracker = BalanceTracker::new(NODE_URL);
+                        if let Some(c) = client {
+                            tracker.set_client((*c).clone());
+                        }
                         let res = tracker.get_all_balances(&accounts, &block_info.hash).await;
                         (date_str, Some(res))
                     } else {
@@ -277,7 +289,7 @@ async fn main() -> Result<()> {
                     }
                 }
             })
-            .buffer_unordered(3);
+            .buffer_unordered(CONCURRENCY_BALANCES);
 
         let mut count = 0;
         let mut failed_dates = Vec::new();
@@ -389,6 +401,8 @@ async fn main() -> Result<()> {
             let local_first = local_first_block;
             let local_url = local_rpc_url.clone();
 
+            let client = chain.client().ok().cloned();
+            let rpc = chain.rpc().ok().cloned();
             let mut stream = stream::iter(missing_date_block_ranges.iter())
                 .map(|(date_str, start_block, end_block)| {
                     let rpc_url = match (&local_url, local_first) {
@@ -396,6 +410,14 @@ async fn main() -> Result<()> {
                         _ => NODE_URL.to_string(),
                     };
                     let mut tracker = RewardTracker::new(&rpc_url);
+                    if rpc_url == NODE_URL {
+                        if let Some(ref c) = client {
+                            tracker.set_client((**c).clone());
+                        }
+                        if let Some(ref r) = rpc {
+                            tracker.set_rpc((**r).clone());
+                        }
+                    }
                     let date_str = date_str.clone();
                     let start = *start_block;
                     let end = *end_block;
@@ -420,7 +442,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 })
-                .buffer_unordered(2);
+                .buffer_unordered(CONCURRENCY_REWARDS);
 
             let mut count = 0;
             while let Some((date_str, rewards_opt)) = stream.next().await {

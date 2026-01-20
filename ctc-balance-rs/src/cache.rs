@@ -102,7 +102,7 @@ pub fn save_reward_cache<P: AsRef<Path>>(cache_file: P, cache: &RewardCache) -> 
 /// Merge new reward entries into existing cache
 pub fn merge_reward_cache(cache: &mut RewardCache, new_entries: RewardCache) {
     for (account, date_rewards) in new_entries {
-        let account_cache = cache.entry(account).or_insert_with(HashMap::new);
+        let account_cache = cache.entry(account).or_default();
         for (date, reward) in date_rewards {
             account_cache.insert(date, reward);
         }
