@@ -6,11 +6,7 @@ import logging
 from dataclasses import dataclass
 from src.chain import ChainConnector
 from src.utils import retry
-
-# CTC 단위
-CTC_DECIMALS = 18
-CTC_DIVISOR = 10**CTC_DECIMALS
-EPSILON = 1e-10  # For safe float comparison
+from src import CTC_DIVISOR, EPSILON
 
 logger = logging.getLogger(__name__)
 

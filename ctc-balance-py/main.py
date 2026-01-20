@@ -18,6 +18,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from filelock import FileLock
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
@@ -28,6 +29,7 @@ from accounts import load_accounts
 from src.chain import ChainConnector
 from src.balance import BalanceTracker
 from src.reward import RewardTracker
+from src import BLOCKS_PER_DAY
 
 
 # Configure logging
@@ -42,10 +44,6 @@ GENESIS_DATE = date(2024, 8, 29)  # 블록 1부터 시작
 OUTPUT_DIR = Path(__file__).parent / "output"
 CACHE_FILE = OUTPUT_DIR / "block_cache.json"
 REWARD_CACHE_FILE = OUTPUT_DIR / "reward_cache.json"
-
-# Block constants
-BLOCK_TIME_SECONDS = 15
-BLOCKS_PER_DAY = 24 * 60 * 60 // BLOCK_TIME_SECONDS  # 5760 blocks
 
 # Concurrency Constants (Matched with Rust version)
 CONCURRENCY_DATES = 5
@@ -66,10 +64,12 @@ def load_block_cache() -> dict:
 
 
 def save_block_cache(cache: dict):
-    """Save date->block mappings to cache."""
+    """Save date->block mappings to cache with file locking."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache, f)
+    lock_file = CACHE_FILE.with_suffix('.lock')
+    with FileLock(lock_file):
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f)
 
 
 def load_reward_cache() -> dict:
@@ -81,10 +81,12 @@ def load_reward_cache() -> dict:
 
 
 def save_reward_cache(cache: dict):
-    """Save rewards to cache."""
+    """Save rewards to cache with file locking."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(REWARD_CACHE_FILE, "w") as f:
-        json.dump(cache, f)
+    lock_file = REWARD_CACHE_FILE.with_suffix('.lock')
+    with FileLock(lock_file):
+        with open(REWARD_CACHE_FILE, "w") as f:
+            json.dump(cache, f)
 
 
 def get_utc_midnight_timestamp(d: date) -> int:
@@ -140,8 +142,9 @@ def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict, refetc
         balances = tracker.get_all_balances(accounts, block_hash, force_refetch=refetch_zero)
         results = {name: b.free for name, b in balances.items()}
         return date_key, results
-    except Exception:
-        # Return empty/zeros on fatal error, or re-raise
+    except Exception as e:
+        # Log the error instead of silently swallowing
+        logger.error(f"Failed to fetch balances for {date_key}: {e}")
         return date_key, {name: 0.0 for name in accounts}
 
 
@@ -506,8 +509,6 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     account_names = sorted(accounts.keys())
-    
-
 
     # Merge new data into existing data
     # all_history is {name: {date: balance}}, convert to {date: {name: balance}}

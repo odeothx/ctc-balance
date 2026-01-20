@@ -3,11 +3,10 @@ from typing import Dict, Optional, Tuple
 from substrateinterface import SubstrateInterface
 from src.chain import NODE_URL
 from src.utils import retry
-
-CTC_DECIMALS = 18
-CTC_DIVISOR = 10**CTC_DECIMALS
+from src import CTC_DIVISOR
 
 logger = logging.getLogger(__name__)
+
 
 
 class StakingReward:
@@ -199,18 +198,29 @@ class RewardTracker:
                 n_reward = r_v_total * (1.0 - commission_ratio) * (n_value / e_total)
                 results[name] += n_reward
 
-    @retry(max_retries=3)
     def _fetch_validator_exposure(self, era: int, v_address: str, block_hash: str) -> Tuple[Optional[Dict], bool]:
-        """Fetch validator exposure (Overview/Paged or Clipped)."""
-        # Try ErasStakersOverview (Paged Staking)
-        res = self.substrate.query("Staking", "ErasStakersOverview", [era, v_address], block_hash=block_hash)
-        if res and res.value:
-            return res.value, True
+        """Fetch validator exposure (Overview/Paged or Clipped).
         
-        # Fallback to ErasStakersClipped
-        res = self.substrate.query("Staking", "ErasStakersClipped", [era, v_address], block_hash=block_hash)
-        if res and res.value:
-            return res.value, False
+        Note: ErasStakersOverview was introduced with paged staking.
+        For older eras/blocks, this storage function doesn't exist,
+        so we catch the exception and fallback to ErasStakersClipped.
+        """
+        # Try ErasStakersOverview (Paged Staking) - may not exist in older runtimes
+        try:
+            res = self.substrate.query("Staking", "ErasStakersOverview", [era, v_address], block_hash=block_hash)
+            if res and res.value:
+                return res.value, True
+        except Exception:
+            # Storage function not found in this runtime version - expected for older blocks
+            pass
+        
+        # Fallback to ErasStakersClipped (legacy, always available)
+        try:
+            res = self.substrate.query("Staking", "ErasStakersClipped", [era, v_address], block_hash=block_hash)
+            if res and res.value:
+                return res.value, False
+        except Exception as e:
+            logger.debug(f"Failed to fetch ErasStakersClipped for era {era}, validator {v_address}: {e}")
             
         return None, False
 

@@ -150,3 +150,22 @@ def retry(
 def format_ctc(amount: float) -> str:
     """Format CTC amount with commas."""
     return f"{amount:,.2f}"
+
+
+def validate_ss58_address(address: str) -> bool:
+    """
+    Validate an SS58 address format.
+    
+    Returns True if the address appears to be a valid SS58 address.
+    Note: This is a basic format check, not a full cryptographic validation.
+    """
+    import re
+    # Basic SS58 format: starts with 5 (Creditcoin prefix), 47-48 characters, alphanumeric
+    if not address:
+        return False
+    if not re.match(r'^[1-9A-HJ-NP-Za-km-z]{47,48}$', address):
+        return False
+    # Creditcoin addresses typically start with 5
+    if not address.startswith('5'):
+        return False
+    return True
