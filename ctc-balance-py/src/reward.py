@@ -236,11 +236,12 @@ class RewardTracker:
         This is the fallback for historical rewards.
         Uses parallel processing for speed.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
         import threading
         
-        # Concurrency for block event scanning (matched with Rust: CONCURRENCY_EVENTS = 50)
-        CONCURRENCY_EVENTS = 50
+        # Reduced concurrency to avoid overwhelming RPC node
+        # Too many connections cause rate limiting or hangs
+        CONCURRENCY_EVENTS = 10
         
         results = {name: 0.0 for name in accounts}
         address_to_name = {addr: name for name, addr in accounts.items()}
@@ -250,17 +251,21 @@ class RewardTracker:
         
         # Thread-safe result aggregation
         results_lock = threading.Lock()
-        processed_count = [0]  # Use list for mutable reference in closure
+        processed_count = [0]
+        
+        # Pre-create a pool of connections (one per worker)
+        url = self.url
         
         def scan_block(block_num: int) -> Dict[str, int]:
             """Scan single block and return rewards found."""
             local_results = {}
             try:
-                # Each thread creates its own connection for safety
                 from substrateinterface import SubstrateInterface
-                substrate = SubstrateInterface(url=self.url)
+                substrate = SubstrateInterface(url=url)
                 try:
                     block_hash = substrate.get_block_hash(block_num)
+                    if block_hash is None:
+                        return local_results
                     events = substrate.get_events(block_hash)
                     
                     for event in events:
@@ -274,26 +279,36 @@ class RewardTracker:
                                     name = address_to_name[stash]
                                     local_results[name] = local_results.get(name, 0) + amount
                 finally:
-                    substrate.close()
+                    try:
+                        substrate.close()
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug(f"Error scanning block {block_num}: {e}")
             return local_results
         
-        # Execute in parallel
+        print(f"    Scanning {total_blocks} blocks (parallel, {CONCURRENCY_EVENTS} workers)...")
+        
+        # Execute in parallel with timeout protection
         with ThreadPoolExecutor(max_workers=CONCURRENCY_EVENTS) as executor:
             future_to_block = {executor.submit(scan_block, bn): bn for bn in block_nums}
             
-            for future in as_completed(future_to_block):
-                block_rewards = future.result()
-                
-                # Aggregate results thread-safely
-                with results_lock:
-                    for name, amount in block_rewards.items():
-                        results[name] += amount
+            for future in as_completed(future_to_block, timeout=300):  # 5 minute timeout
+                try:
+                    block_rewards = future.result(timeout=30)  # 30 second per-block timeout
                     
-                    processed_count[0] += 1
-                    if total_blocks > 100 and (processed_count[0] % 500 == 0 or processed_count[0] == total_blocks):
-                        print(f"    Scanning blocks: {processed_count[0] * 100 // total_blocks}% ({processed_count[0]}/{total_blocks})")
+                    with results_lock:
+                        for name, amount in block_rewards.items():
+                            results[name] += amount
+                        
+                        processed_count[0] += 1
+                        if processed_count[0] % 500 == 0 or processed_count[0] == total_blocks:
+                            print(f"    Scanning blocks: {processed_count[0] * 100 // total_blocks}% ({processed_count[0]}/{total_blocks})")
+                except TimeoutError:
+                    block_num = future_to_block[future]
+                    logger.warning(f"Timeout scanning block {block_num}")
+                except Exception as e:
+                    logger.debug(f"Error in future: {e}")
 
         return {name: StakingReward(claimed=amt / CTC_DIVISOR) for name, amt in results.items()}
 
