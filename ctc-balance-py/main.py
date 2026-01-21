@@ -127,9 +127,9 @@ def init_worker():
 
 def _find_block_worker(d: date) -> tuple[date, int, str]:
     """Worker for finding block in parallel."""
-    # use global connection
+    global worker_chain
     if worker_chain is None:
-        raise RuntimeError("Worker chain not initialized")
+        worker_chain = ChainConnector()
         
     # Retry loop
     for attempt in range(3):
@@ -151,8 +151,9 @@ def _find_block_worker(d: date) -> tuple[date, int, str]:
 
 def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict, refetch_zero: bool = False) -> tuple[str, dict]:
     """Worker for fetching balances in parallel."""
+    global worker_chain
     if worker_chain is None:
-         raise RuntimeError("Worker chain not initialized")
+        worker_chain = ChainConnector()
 
     tracker = BalanceTracker(worker_chain)
     results = {}
@@ -243,7 +244,7 @@ def find_blocks_for_dates(chain: ChainConnector, dates: list[date], cache: dict)
     
     print(f"  Finding blocks for {len(dates_to_find)} uncached dates (Parallel)...")
     
-    with ProcessPoolExecutor(max_workers=CONCURRENCY_DATES, initializer=init_worker) as executor:
+    with ProcessPoolExecutor(max_workers=CONCURRENCY_DATES) as executor:
         future_to_date = {executor.submit(_find_block_worker, d): d for d in dates_to_find}
         
         completed_count = 0
@@ -464,7 +465,7 @@ def main():
         if block_info:
             tasks.append((key, block_info["hash"]))
 
-    with ProcessPoolExecutor(max_workers=CONCURRENCY_BALANCES, initializer=init_worker) as executor:
+    with ProcessPoolExecutor(max_workers=CONCURRENCY_BALANCES) as executor:
         future_to_task = {
             executor.submit(_fetch_balance_worker, key, block_hash, accounts, args.refetch_zero): key 
             for key, block_hash in tasks

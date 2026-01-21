@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 from substrateinterface import SubstrateInterface
 from src.chain import NODE_URL
 from src.utils import retry
@@ -123,21 +123,152 @@ class RewardTracker:
         if total_points == 0:
             return
 
-        # 3. Process each validator
+        # 3. Process each validator in parallel
+        # Matches Rust's intra-era parallelization strategy
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from src import CONCURRENCY_EXPOSURES
+        
         if isinstance(individual_points, dict):
-            items = individual_points.items()
+            items = list(individual_points.items())
         else:
-            items = individual_points
+            items = list(individual_points)
 
-        for v_address, p_v in items:
+        # Concurrency Exposures - Reduced for stability with substrate-interface
+        CONCURRENCY_EXPOSURES_INNER = 10
+        
+        results_lock = threading.Lock()
+        init_lock = threading.Lock()
+        
+        # Thread-local storage for RPC connections
+        _thread_local = threading.local()
+        url = self.url
+        
+        def get_thread_substrate():
+            if not hasattr(_thread_local, "substrate"):
+                # Use lock to prevent multiple threads from initializing metadata at once
+                with init_lock:
+                    try:
+                        # Pre-connect to ensure metadata is fetched within the lock
+                        s = SubstrateInterface(url=url)
+                        _thread_local.substrate = s
+                    except Exception as e:
+                        logger.error(f"Failed to initialize thread-local substrate: {e}")
+                        return None
+            return _thread_local.substrate
+
+        def process_validator(v_address, p_v):
             p_v = float(p_v)
             if p_v == 0:
-                continue
+                return
 
             # Validator's total reward share for this era
             r_v_total = (total_reward_val * p_v) / total_points
             
-            self._process_validator_reward(era, block_hash, v_address, r_v_total, address_to_name, results)
+            # Use thread-local connection
+            substrate = get_thread_substrate()
+            if not substrate:
+                return
+            
+            # Fetch pref/exposure concurrently
+            try:
+                self._process_validator_reward_concurrent(
+                    substrate, era, block_hash, v_address, r_v_total, address_to_name, results, results_lock
+                )
+            except Exception as e:
+                logger.debug(f"Error in _process_validator_reward_concurrent: {e}")
+
+        with ThreadPoolExecutor(max_workers=CONCURRENCY_EXPOSURES_INNER) as executor:
+            futures = [executor.submit(process_validator, v_address, p_v) for v_address, p_v in items]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error processing validator reward: {e}")
+        
+        # Cleanup connections in threads is left to GC/pool shutdown
+
+    def _process_validator_reward_concurrent(
+        self,
+        substrate: SubstrateInterface,
+        era: int, 
+        block_hash: str, 
+        v_address: str, 
+        r_v_total: float, 
+        address_to_name: Dict[str, str], 
+        results: Dict[str, float],
+        lock: Any
+    ):
+        """Process a single validator's rewards (Thread-safe version)."""
+        # Get validator commission
+        prefs_result = substrate.query(
+            module="Staking",
+            storage_function="ErasValidatorPrefs",
+            params=[era, v_address],
+            block_hash=block_hash
+        )
+        commission_ratio = 0.0
+        if prefs_result and prefs_result.value:
+            commission_ratio = float(prefs_result.value.get("commission", 0)) / 1_000_000_000.0
+
+        # Get validator exposure
+        exposure, is_paged = self._fetch_validator_exposure_concurrent(substrate, era, v_address, block_hash)
+        if not exposure:
+            return
+
+        e_total = float(exposure.get("total", 0))
+        e_own = float(exposure.get("own", 0))
+        if e_total == 0:
+            return
+
+        # Case 1: Tracked account is the validator
+        if v_address in address_to_name:
+            name = address_to_name[v_address]
+            validator_reward = (r_v_total * commission_ratio) + \
+                               (r_v_total * (1.0 - commission_ratio) * (e_own / e_total))
+            with lock:
+                results[name] += validator_reward
+
+        # Case 2: Tracked account is a nominator
+        others = exposure.get("others", [])
+        if is_paged and (page_count := exposure.get("page_count", 0)):
+            for page_idx in range(page_count):
+                paged_result = substrate.query(
+                    module="Staking",
+                    storage_function="ErasStakersPaged",
+                    params=[era, v_address, page_idx],
+                    block_hash=block_hash
+                )
+                if paged_result and paged_result.value:
+                    others.extend(paged_result.value.get("others", []))
+
+        for nominator in others:
+            n_address = nominator.get("who")
+            n_value = float(nominator.get("value", 0))
+            
+            if n_address in address_to_name:
+                name = address_to_name[n_address]
+                n_reward = r_v_total * (1.0 - commission_ratio) * (n_value / e_total)
+                with lock:
+                    results[name] += n_reward
+
+    def _fetch_validator_exposure_concurrent(self, substrate: SubstrateInterface, era: int, v_address: str, block_hash: str) -> Tuple[Optional[Dict], bool]:
+        """Fetch validator exposure concurrently using provided substrate connection."""
+        try:
+            res = substrate.query("Staking", "ErasStakersOverview", [era, v_address], block_hash=block_hash)
+            if res and res.value:
+                return res.value, True
+        except Exception:
+            pass
+        
+        try:
+            res = substrate.query("Staking", "ErasStakersClipped", [era, v_address], block_hash=block_hash)
+            if res and res.value:
+                return res.value, False
+        except Exception as e:
+            logger.debug(f"Failed to fetch ErasStakersClipped for era {era}, validator {v_address}: {e}")
+            
+        return None, False
 
     def _process_validator_reward(
         self, 
@@ -239,9 +370,7 @@ class RewardTracker:
         from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
         import threading
         
-        # Reduced concurrency to avoid overwhelming RPC node
-        # Too many connections cause rate limiting or hangs
-        CONCURRENCY_EVENTS = 10
+        from src import CTC_DIVISOR, CONCURRENCY_EVENTS
         
         results = {name: 0.0 for name in accounts}
         address_to_name = {addr: name for name, addr in accounts.items()}
@@ -253,62 +382,68 @@ class RewardTracker:
         results_lock = threading.Lock()
         processed_count = [0]
         
-        # Pre-create a pool of connections (one per worker)
-        url = self.url
+        # Thread-local storage for connections
+        _thread_local = threading.local()
         
+        def get_conn():
+            """Get or create connection for the current thread."""
+            if not hasattr(_thread_local, "substrate"):
+                _thread_local.substrate = SubstrateInterface(url=url)
+            return _thread_local.substrate
+
         def scan_block(block_num: int) -> Dict[str, int]:
             """Scan single block and return rewards found."""
             local_results = {}
             try:
-                from substrateinterface import SubstrateInterface
-                substrate = SubstrateInterface(url=url)
-                try:
-                    block_hash = substrate.get_block_hash(block_num)
-                    if block_hash is None:
-                        return local_results
-                    events = substrate.get_events(block_hash)
-                    
-                    for event in events:
-                        if event.value['module_id'] == 'Staking' and event.value['event_id'] in ('Rewarded', 'Reward'):
-                            params = event.value['params']
-                            if len(params) >= 2:
-                                stash = params[0]['value']
-                                amount = int(params[1]['value'])
-                                
-                                if stash in address_to_name:
-                                    name = address_to_name[stash]
-                                    local_results[name] = local_results.get(name, 0) + amount
-                finally:
-                    try:
-                        substrate.close()
-                    except Exception:
-                        pass
+                substrate = get_conn()
+                block_hash = substrate.get_block_hash(block_num)
+                if block_hash is None:
+                    return local_results
+                events = substrate.get_events(block_hash)
+                
+                for event in events:
+                    if event.value['module_id'] == 'Staking' and event.value['event_id'] in ('Rewarded', 'Reward'):
+                        params = event.value['params']
+                        if len(params) >= 2:
+                            stash = params[0]['value']
+                            amount = int(params[1]['value'])
+                            
+                            if stash in address_to_name:
+                                name = address_to_name[stash]
+                                local_results[name] = local_results.get(name, 0) + amount
             except Exception as e:
+                # If connection error, clear for next time
+                if hasattr(_thread_local, "substrate"):
+                    try:
+                        _thread_local.substrate.close()
+                    except:
+                        pass
+                    delattr(_thread_local, "substrate")
                 logger.debug(f"Error scanning block {block_num}: {e}")
             return local_results
         
-        print(f"    Scanning {total_blocks} blocks (parallel, {CONCURRENCY_EVENTS} workers)...")
+        print(f"    Scanning {total_blocks} blocks (parallel, {CONCURRENCY_EVENTS} workers with reused connections)...")
         
         # Execute in parallel with timeout protection
         with ThreadPoolExecutor(max_workers=CONCURRENCY_EVENTS) as executor:
             future_to_block = {executor.submit(scan_block, bn): bn for bn in block_nums}
             
-            for future in as_completed(future_to_block, timeout=300):  # 5 minute timeout
+            for future in as_completed(future_to_block):
                 try:
-                    block_rewards = future.result(timeout=30)  # 30 second per-block timeout
+                    block_rewards = future.result()
                     
                     with results_lock:
                         for name, amount in block_rewards.items():
                             results[name] += amount
                         
                         processed_count[0] += 1
-                        if processed_count[0] % 500 == 0 or processed_count[0] == total_blocks:
+                        if processed_count[0] % 1000 == 0 or processed_count[0] == total_blocks:
                             print(f"    Scanning blocks: {processed_count[0] * 100 // total_blocks}% ({processed_count[0]}/{total_blocks})")
-                except TimeoutError:
-                    block_num = future_to_block[future]
-                    logger.warning(f"Timeout scanning block {block_num}")
                 except Exception as e:
-                    logger.debug(f"Error in future: {e}")
+                    logger.debug(f"Error in future result: {e}")
+        
+        # Clean up connections for all threads is tricky in a pool, 
+        # but the pool itself will eventually close them when threads die.
 
         return {name: StakingReward(claimed=amt / CTC_DIVISOR) for name, amt in results.items()}
 

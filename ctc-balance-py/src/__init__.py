@@ -10,3 +10,6 @@ EPSILON = 1e-10  # For safe float comparison
 # Block timing
 BLOCK_TIME_SECONDS = 15
 BLOCKS_PER_DAY = 24 * 60 * 60 // BLOCK_TIME_SECONDS  # 5760 blocks
+# Concurrency Constants
+CONCURRENCY_EXPOSURES = 20
+CONCURRENCY_EVENTS = 50
