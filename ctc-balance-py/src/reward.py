@@ -234,19 +234,66 @@ class RewardTracker:
         """
         Scan all blocks in range for Staking(Rewarded) events.
         This is the fallback for historical rewards.
+        Uses parallel processing for speed.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
+        # Concurrency for block event scanning (matched with Rust: CONCURRENCY_EVENTS = 50)
+        CONCURRENCY_EVENTS = 50
+        
         results = {name: 0.0 for name in accounts}
         address_to_name = {addr: name for name, addr in accounts.items()}
         
         total_blocks = end_block - start_block + 1
-        processed = 0
-
-        for block_num in range(start_block, end_block + 1):
-            processed += 1
-            if total_blocks > 100 and (processed % 100 == 0 or processed == total_blocks):
-                print(f"    Scanning blocks: {processed * 100 // total_blocks}% ({processed}/{total_blocks})")
+        block_nums = list(range(start_block, end_block + 1))
+        
+        # Thread-safe result aggregation
+        results_lock = threading.Lock()
+        processed_count = [0]  # Use list for mutable reference in closure
+        
+        def scan_block(block_num: int) -> Dict[str, int]:
+            """Scan single block and return rewards found."""
+            local_results = {}
+            try:
+                # Each thread creates its own connection for safety
+                from substrateinterface import SubstrateInterface
+                substrate = SubstrateInterface(url=self.url)
+                try:
+                    block_hash = substrate.get_block_hash(block_num)
+                    events = substrate.get_events(block_hash)
+                    
+                    for event in events:
+                        if event.value['module_id'] == 'Staking' and event.value['event_id'] in ('Rewarded', 'Reward'):
+                            params = event.value['params']
+                            if len(params) >= 2:
+                                stash = params[0]['value']
+                                amount = int(params[1]['value'])
+                                
+                                if stash in address_to_name:
+                                    name = address_to_name[stash]
+                                    local_results[name] = local_results.get(name, 0) + amount
+                finally:
+                    substrate.close()
+            except Exception as e:
+                logger.debug(f"Error scanning block {block_num}: {e}")
+            return local_results
+        
+        # Execute in parallel
+        with ThreadPoolExecutor(max_workers=CONCURRENCY_EVENTS) as executor:
+            future_to_block = {executor.submit(scan_block, bn): bn for bn in block_nums}
             
-            self._process_block_events(block_num, address_to_name, results)
+            for future in as_completed(future_to_block):
+                block_rewards = future.result()
+                
+                # Aggregate results thread-safely
+                with results_lock:
+                    for name, amount in block_rewards.items():
+                        results[name] += amount
+                    
+                    processed_count[0] += 1
+                    if total_blocks > 100 and (processed_count[0] % 500 == 0 or processed_count[0] == total_blocks):
+                        print(f"    Scanning blocks: {processed_count[0] * 100 // total_blocks}% ({processed_count[0]}/{total_blocks})")
 
         return {name: StakingReward(claimed=amt / CTC_DIVISOR) for name, amt in results.items()}
 
