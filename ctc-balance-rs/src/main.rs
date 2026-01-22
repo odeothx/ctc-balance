@@ -135,6 +135,7 @@ async fn main() -> Result<()> {
 
     let local_rpc_url = args.local_rpc.clone();
     let latest_block = chain.get_latest_block_number().await.unwrap_or(0);
+    let rpc_methods = chain.rpc().ok().cloned();
 
     // 3. Find blocks for dates
     println!("\n[3/6] Finding blocks for dates...");
@@ -168,15 +169,27 @@ async fn main() -> Result<()> {
 
     let output_dir = PathBuf::from("output");
     let cache_file = output_dir.join("block_cache.json");
-    let mut cache: BlockCache = if args.no_cache {
-        HashMap::new()
-    } else {
-        load_block_cache(&cache_file).unwrap_or_default()
-    };
+    let mut cache: BlockCache = load_block_cache(&cache_file).unwrap_or_default();
+
+    let today_str = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+    let yesterday_str = Utc::now()
+        .date_naive()
+        .checked_sub_days(chrono::Days::new(1))
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    let last_cached_date = cache.keys().max().cloned();
 
     let dates_to_find: Vec<NaiveDate> = dates
         .iter()
-        .filter(|d| !cache.contains_key(&d.format("%Y-%m-%d").to_string()))
+        .filter(|d| {
+            let d_str = d.format("%Y-%m-%d").to_string();
+            !cache.contains_key(&d_str)
+                || args.no_cache
+                || d_str == today_str
+                || d_str == yesterday_str
+                || Some(&d_str) == last_cached_date.as_ref()
+        })
         .cloned()
         .collect();
 
@@ -191,13 +204,17 @@ async fn main() -> Result<()> {
         let mut stream = stream::iter(dates_to_find.iter())
             .map(|&d| {
                 let client = client.clone();
+                let rpc = rpc_methods.clone();
                 let date_str = d.format("%Y-%m-%d").to_string();
                 let timestamp = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as u64;
                 async move {
-                    // Create a temporary connector that reuses the client
+                    // Create a temporary connector that reuses the client and rpc
                     let mut temp_chain = ChainConnector::new(Some(NODE_URL));
                     if let Some(c) = client {
                         temp_chain.set_client(c);
+                    }
+                    if let Some(r) = rpc {
+                        temp_chain.set_rpc(r);
                     }
                     let res = temp_chain.find_block_at_timestamp(timestamp, 60).await;
                     (date_str, res)
@@ -206,13 +223,25 @@ async fn main() -> Result<()> {
             .buffer_unordered(CONCURRENCY_DATES);
 
         let mut count = 0;
+        let mut found = 0;
         while let Some((date_str, res)) = stream.next().await {
-            if let Ok(block_info) = res {
-                cache.insert(date_str, block_info);
+            match res {
+                Ok(block_info) => {
+                    cache.insert(date_str, block_info);
+                    found += 1;
+                }
+                Err(e) => {
+                    eprintln!("    Warning: Failed to find block for {}: {}", date_str, e);
+                }
             }
             count += 1;
             if count % 10 == 0 || count == dates_to_find.len() {
-                println!("    {}/{} blocks found...", count, dates_to_find.len());
+                println!(
+                    "    {}/{} dates processed ({} blocks found)...",
+                    count,
+                    dates_to_find.len(),
+                    found
+                );
                 save_block_cache(&cache_file, &cache)?;
             }
         }
@@ -232,10 +261,20 @@ async fn main() -> Result<()> {
         names
     };
 
+    let last_existing_date = existing_data.values().flat_map(|h| h.keys().cloned()).max();
+
     let dates_to_fetch: Vec<String> = dates
         .iter()
         .map(|d| d.format("%Y-%m-%d").to_string())
         .filter(|date_str| {
+            if args.no_cache
+                || date_str == &today_str
+                || date_str == &yesterday_str
+                || Some(date_str) == last_existing_date.as_ref()
+            {
+                return true;
+            }
+
             // 1. Always fetch if any account is missing data for this date
             let any_missing = account_names.iter().any(|name| {
                 existing_data
@@ -334,17 +373,16 @@ async fn main() -> Result<()> {
     let mut full_reward_history: RewardCache = HashMap::new();
     if !args.no_rewards {
         let reward_cache_file = output_dir.join("reward_cache.json");
-        let mut reward_cache = if args.no_cache {
-            HashMap::new()
-        } else {
-            load_reward_cache(&reward_cache_file).unwrap_or_default()
-        };
+        let mut reward_cache = load_reward_cache(&reward_cache_file).unwrap_or_default();
 
         println!("\n[5/6] Fetching staking rewards (block scanning)...");
         let date_strings: Vec<String> = dates
             .iter()
             .map(|d| d.format("%Y-%m-%d").to_string())
             .collect();
+
+        let last_reward_date = reward_cache.values().flat_map(|h| h.keys().cloned()).max();
+
         let mut missing_date_block_ranges = Vec::new();
 
         for (i, date_str) in date_strings.iter().enumerate() {
@@ -361,7 +399,12 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if !all_present {
+            if !all_present
+                || args.no_cache
+                || date_str == &today_str
+                || date_str == &yesterday_str
+                || Some(date_str) == last_reward_date.as_ref()
+            {
                 if let Some(start_info) = cache.get(date_str) {
                     let next_block = date_strings
                         .get(i + 1)
@@ -592,22 +635,30 @@ async fn detect_first_block(url: &str, latest_block: u64) -> u64 {
     if tracker.connect().await.is_err() {
         return 0;
     }
+    let mut low = 0u64;
+    let mut high = latest_block;
+    let mut first_block = 0;
+
+    // Fast path: check block 0 and 1
     if tracker.has_events(0).await && tracker.has_events(1).await {
         return 0;
     }
-    let mut low = 0u64;
-    let mut high = latest_block;
-    while low < high {
-        let mid = (low + high) / 2;
+
+    while low <= high {
+        let mid = low + (high - low) / 2;
         if mid == 0 {
             low = 1;
             continue;
         }
         if tracker.has_events(mid).await {
-            high = mid;
+            first_block = mid;
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
         } else {
             low = mid + 1;
         }
     }
-    low
+    first_block
 }

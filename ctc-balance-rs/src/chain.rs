@@ -63,7 +63,7 @@ impl ChainConnector {
 
     /// Ensure connected, connect if not
     async fn ensure_connected(&mut self) -> Result<()> {
-        if self.client.is_none() {
+        if self.client.is_none() || self.rpc.is_none() {
             self.connect().await?;
         }
         Ok(())
@@ -186,13 +186,37 @@ impl ChainConnector {
         tolerance_seconds: u64,
     ) -> Result<BlockInfo> {
         let latest_block = self.get_latest_block_number().await?;
+        let latest_hash = self.get_block_hash(latest_block).await?;
+        let latest_ts = self.get_block_timestamp(&latest_hash).await?;
+
+        // If target is in the future, return latest block
+        if target_timestamp >= latest_ts {
+            return Ok(BlockInfo {
+                block: latest_block,
+                hash: latest_hash,
+            });
+        }
+
+        let genesis_ts = self.get_genesis_timestamp().await?;
+        // If target is before genesis, return block 1
+        if target_timestamp <= genesis_ts {
+            return Ok(BlockInfo {
+                block: 1,
+                hash: self.get_block_hash(1).await?,
+            });
+        }
 
         // Estimate block number
-        let genesis_ts = self.get_genesis_timestamp().await?;
-        let estimated_block = ((target_timestamp - genesis_ts) / BLOCK_TIME_SECONDS) as u64;
+        let total_time = latest_ts.saturating_sub(genesis_ts);
+        let block_rate = if total_time > 0 {
+            latest_block as f64 / total_time as f64
+        } else {
+            1.0 / BLOCK_TIME_SECONDS as f64
+        };
+        let estimated_block = ((target_timestamp - genesis_ts) as f64 * block_rate) as u64;
 
         // Search window
-        let window = 20000u64;
+        let window = 40000u64; // Doubled window for safety
         let mut low = estimated_block.saturating_sub(window);
         let mut high = std::cmp::min(latest_block, estimated_block + window);
 
@@ -202,6 +226,10 @@ impl ChainConnector {
 
         while low <= high {
             let mid = (low + high) / 2;
+            if mid == 0 {
+                low = 1;
+                continue;
+            }
             let block_hash = self.get_block_hash(mid).await?;
             let block_time = self.get_block_timestamp(&block_hash).await?;
 
@@ -223,9 +251,6 @@ impl ChainConnector {
             if block_time < target_timestamp {
                 low = mid + 1;
             } else {
-                if mid == 0 {
-                    break;
-                }
                 high = mid - 1;
             }
         }
