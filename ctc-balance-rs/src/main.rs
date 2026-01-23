@@ -19,6 +19,7 @@ use ctc_balance::{
     csv_output::{
         calculate_diffs, load_existing_csv, save_combined_csv, save_individual_csvs, HistoryEntry,
     },
+    fetch_ctc_price,
     plot::plot_balances,
     reward::RewardTracker,
     CONCURRENCY_BALANCES, CONCURRENCY_DATES, CONCURRENCY_REWARDS, GENESIS_DATE, NODE_URL,
@@ -623,7 +624,19 @@ async fn main() -> Result<()> {
     }
 
     if let Some(latest) = entries.last() {
-        println!("\n  Latest ({}): {:.1} CTC", latest.date, latest.total);
+        print!("\n  Latest ({}): {:.1} CTC", latest.date, latest.total);
+
+        // Fetch and display price
+        match fetch_ctc_price().await {
+            Ok(price) => {
+                let value = latest.total * price;
+                print!(" (Value: ${:.2} @ ${:.4})", value, price);
+            }
+            Err(e) => {
+                print!(" (Price fetch failed: {})", e);
+            }
+        }
+        println!();
     }
 
     println!("\n{}\nCOMPLETED!\n{}", "=".repeat(60), "=".repeat(60));

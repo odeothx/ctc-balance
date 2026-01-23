@@ -8,6 +8,7 @@ pub mod cache;
 pub mod chain;
 pub mod csv_output;
 pub mod plot;
+pub mod price;
 pub mod reward;
 pub use accounts::load_accounts;
 pub use balance::{Balance, BalanceTracker};
@@ -16,6 +17,7 @@ pub use cache::{
     RewardCache,
 };
 pub use chain::ChainConnector;
+pub use price::fetch_ctc_price;
 pub use reward::{RewardTracker, StakingReward};
 
 /// Creditcoin3 mainnet genesis date (2024-08-29)
