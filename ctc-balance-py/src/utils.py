@@ -78,7 +78,7 @@ def create_csv_header(account_names: list[str]) -> list[str]:
     header = ["date", "block_number", "block_hash"]
     for name in sorted(account_names):
         header.extend([f"{name}_free", f"{name}_reserved", f"{name}_total"])
-    header.append("total_free")
+    header.append("total")
     return header
 
 
@@ -91,15 +91,15 @@ def create_csv_row(
 ) -> list[Any]:
     """Create CSV data row."""
     row = [d.isoformat(), block_number, block_hash]
-    total_free = 0.0
+    total = 0.0
     for name in sorted(account_names):
         balance = balances.get(name)
         if balance:
             row.extend([balance.free, balance.reserved, balance.total])
-            total_free += balance.free
+            total += balance.total
         else:
             row.extend([0.0, 0.0, 0.0])
-    row.append(total_free)
+    row.append(total)
     return row
 
 

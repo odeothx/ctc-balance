@@ -340,7 +340,7 @@ async fn main() -> Result<()> {
                         existing_data
                             .entry(name)
                             .or_insert_with(HashMap::new)
-                            .insert(date_str.clone(), balance.free);
+                            .insert(date_str.clone(), balance.total());
                     }
                 }
                 Some(Err(e)) => {

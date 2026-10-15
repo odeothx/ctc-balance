@@ -161,7 +161,7 @@ def _fetch_balance_worker(date_key: str, block_hash: str, accounts: dict, refetc
     try:
         # returns {name: Balance}
         balances = tracker.get_all_balances(accounts, block_hash, force_refetch=refetch_zero)
-        results = {name: b.free for name, b in balances.items()}
+        results = {name: b.total for name, b in balances.items()}
         return date_key, results
     except Exception as e:
         # Log the error instead of silently swallowing
